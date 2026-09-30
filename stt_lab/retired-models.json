@@ -1,0 +1,53 @@
+{
+  "retired_on": "2026-09-22",
+  "reason": "User selected Apex and Trelis; Swift and Srota retired. Unused generic baseline deferred. Historical results are retained, not active candidates.",
+  "models": [
+    {
+      "id": "swift",
+      "model_id": "swift",
+      "repo_id": "Oriserve/Whisper-Hindi2Hinglish-Swift",
+      "source_revision": "cd0d4d013062d542569135460a79025337df1982",
+      "family": "whisper",
+      "license": "apache-2.0",
+      "role": "lightweight_candidate",
+      "output_script": "roman",
+      "decoding": {
+        "task": "transcribe",
+        "language": "en",
+        "num_beams": 5,
+        "max_new_tokens": 256
+      },
+      "status": "unqualified"
+    },
+    {
+      "id": "srota",
+      "model_id": "srota",
+      "repo_id": "moorlee/qwen3-asr-0.6b-hinglish",
+      "source_revision": "188ae2b61f932feb998e3b3c7a868e927a467031",
+      "family": "qwen_asr",
+      "license": "apache-2.0",
+      "role": "live_candidate",
+      "output_script": "mixed",
+      "decoding": {
+        "language": null,
+        "max_audio_seconds": 30
+      },
+      "status": "unqualified"
+    },
+    {
+      "id": "turbo",
+      "model_id": "turbo",
+      "repo_id": "openai/whisper-large-v3-turbo",
+      "source_revision": "41f01f3fe87f28c78e2fbf8b568835947dd65ed9",
+      "family": "whisper",
+      "license": "mit",
+      "role": "benchmark_baseline",
+      "output_script": "mixed",
+      "decoding": {
+        "task": "transcribe",
+        "language": null
+      },
+      "status": "unqualified"
+    }
+  ]
+}

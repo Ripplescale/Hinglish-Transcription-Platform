@@ -1,0 +1,82 @@
+'use client';
+
+import { useEffect, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { useRouter } from 'next/navigation';
+import { Button } from '@/components/ui/button';
+import { useLocalWorkflow } from '@/contexts/LocalWorkflowContext';
+import { useRecordingState } from '@/contexts/RecordingStateContext';
+import { isTerminalJob, pathKey, type LocalJob, type LocalPreferences, type LocalProfile } from '@/lib/local-transcription-workflow';
+
+export function LocalTranscriptionPanel({ sessionDir, meetingId, projectId = null }: { sessionDir?: string; meetingId?: string; projectId?: string | null }) {
+  const { state, workflow } = useLocalWorkflow();
+  const { isRecording } = useRecordingState();
+  const [profiles, setProfiles] = useState<LocalProfile[]>([]);
+  const [previousJobs, setPreviousJobs] = useState<LocalJob[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [selectedJob, setSelectedJob] = useState<string>();
+  const router = useRouter();
+  const { preferences } = state;
+  const [rerunProfile, setRerunProfile] = useState<LocalPreferences['profile']>('trelis-20');
+  const [rerunLanguage, setRerunLanguage] = useState<LocalPreferences['languageMode']>(preferences.languageMode);
+  const selectedProfile = meetingId ? rerunProfile : 'apex-20';
+  const selectedLanguage = meetingId ? rerunLanguage : preferences.languageMode;
+  const matchingRuns = sessionDir ? state.runs.filter(item => pathKey(item.capture.session_dir) === pathKey(sessionDir)) : state.runs.filter(item => item.capture.session_id === state.currentSession);
+  const run = matchingRuns.find(item => item.job?.job_id === selectedJob) ?? matchingRuns.find(item => meetingId && item.transcriptMeetingId === meetingId) ?? matchingRuns.find(item => item.job && !isTerminalJob(item.job.state)) ?? matchingRuns.find(item => 'role' in item && item.role === 'final') ?? matchingRuns[0];
+  const job = run?.job;
+  const active = state.runs.some(item => (item.job && !isTerminalJob(item.job.state)) || (item.speakerJob && !isTerminalJob(item.speakerJob.state)));
+  const currentProfile = profiles.find(profile => profile.id === selectedProfile);
+  const update = (patch: Partial<LocalPreferences>) => {
+    if (meetingId) {
+      if (patch.profile) setRerunProfile(patch.profile);
+      if (patch.languageMode) setRerunLanguage(patch.languageMode);
+    } else workflow.setPreferences({ ...preferences, languageMode: patch.languageMode ?? preferences.languageMode });
+  };
+  const openTranscript = (id: string) => {
+    const href = `/meeting-details?id=${encodeURIComponent(id)}`;
+    if (window.dispatchEvent(new CustomEvent('xx-before-navigate', { cancelable: true, detail: { href } }))) router.push(href);
+  };
+  const loadProfiles = () => invoke<LocalProfile[]>('get_local_stt_profiles').then(result => { setProfiles(result.filter(profile => ['trelis-20', 'apex-20'].includes(profile.id))); setError(null); }).catch(reason => setError(String(reason)));
+
+  useEffect(() => { void loadProfiles(); }, []);
+  useEffect(() => {
+    if (!sessionDir) return;
+    let cancelled = false;
+    invoke<LocalJob[]>('list_local_transcription_jobs', { sessionDir }).then(result => { if (!cancelled) setPreviousJobs(result); }).catch(reason => { if (!cancelled) setError(String(reason)); });
+    return () => { cancelled = true; };
+  }, [sessionDir, job?.state]);
+
+  const rerun = async () => {
+    if (!sessionDir || !meetingId) return;
+    setBusy(true); setError(null);
+    try {
+      const result = await invoke<LocalJob>('start_local_transcription', { sessionDir, profile: rerunProfile, languageMode: rerunLanguage, projectId });
+      await workflow.adopt({ ...result, session_dir: sessionDir, profile: rerunProfile }, meetingId, false);
+      setSelectedJob(result.job_id);
+    } catch (reason) { setError(String(reason)); }
+    finally { setBusy(false); }
+  };
+  const action = async (operation: () => Promise<void>) => {
+    setBusy(true); setError(null);
+    try { await operation(); } catch (reason) { setError(String(reason)); } finally { setBusy(false); }
+  };
+
+  return <section className={`${meetingId ? '' : 'xx-paper rounded-2xl p-5'} space-y-3 text-[var(--xx-ink)]`} aria-label="Local transcription">
+    <div className="flex flex-wrap items-center justify-between gap-2"><h2 className="text-sm font-medium">{meetingId ? 'For another version' : 'Every recording, taken care of'}</h2><span className="text-[11px] text-[var(--xx-muted)]">On this device</span></div>
+    {!meetingId && <p className="text-sm leading-6">Apex live draft <span className="mx-1 text-[var(--xx-muted)]">→</span> Trelis final transcript</p>}
+    <div className="flex flex-wrap gap-3">
+      {meetingId && <label className="min-w-0 flex-[1_1_220px] text-xs text-[var(--xx-muted)] space-y-1.5"><span className="block">Model for this version</span><select aria-label="Local transcription profile" className="w-full min-w-0 rounded-lg border border-[var(--xx-border)] bg-[var(--xx-paper)] p-2 text-sm text-[var(--xx-ink)] focus:outline-[var(--xx-accent)]" disabled={isRecording || busy} value={selectedProfile} onChange={event => update({ profile: event.target.value as LocalPreferences['profile'] })}><option value="trelis-20">Trelis · 20s · Hindi + English script</option><option value="apex-20">Apex · 20s · Roman Hinglish</option></select></label>}
+      <label className="flex-[1_1_100px] text-xs text-[var(--xx-muted)] space-y-1.5"><span className="block">Language</span><select aria-label="Recording language" className="w-full rounded-lg border border-[var(--xx-border)] bg-[var(--xx-paper)] p-2 text-sm text-[var(--xx-ink)] focus:outline-[var(--xx-accent)]" disabled={isRecording || busy} value={selectedLanguage} onChange={event => update({ languageMode: event.target.value as LocalPreferences['languageMode'] })}><option value="hinglish">Hinglish</option><option value="english">English</option></select></label>
+    </div>
+    {!meetingId && <p className="text-xs leading-5 text-[var(--xx-muted)]">Apex adds text in 20-second windows, plus processing time, while you talk. After you stop, Trelis makes the final transcript in its original Hindi + English script. Both versions and your corrections are kept.</p>}
+    {(meetingId ? profiles.filter(profile => profile.id === currentProfile?.id && !profile.available) : profiles.filter(profile => !profile.available)).map(profile => <div key={profile.id} className="text-xs text-amber-800"><p>{profile.id === 'apex-20' ? 'Apex' : 'Trelis'}: {profile.reason || 'The model is not installed. You can still record and transcribe later.'}</p><button type="button" className="underline mt-1" onClick={() => void loadProfiles()}>Check model setup again</button></div>)}
+    {error && <p role="alert" className="text-xs text-red-700">{error}</p>}
+    {run?.error && <p role="alert" className="text-xs text-amber-800">{run.error}</p>}
+    {run && !job && <p className="text-xs text-gray-600" role="status">{run.recording && run.preferences.timing === 'after-recording' ? 'Recording audio. Transcription starts when you stop.' : run.error ? 'Transcription needs attention.' : 'Waiting for the local worker to become available.'}</p>}
+    {job && <div className="space-y-2 text-xs"><p role="status">{job.profile}: {job.state.replaceAll('_', ' ')} · {Math.round(job.processed_audio_seconds ?? 0)}s processed · {Math.round(job.backlog_seconds ?? 0)}s waiting</p>{job.error && <p className="text-red-700">{job.error}</p>}<div className="flex flex-wrap gap-2">{!isTerminalJob(job.state) && <Button size="sm" variant="outline" disabled={busy} onClick={() => void action(() => workflow.stopWorker(run!))}>Pause transcription</Button>}{run?.transcriptMeetingId && run.transcriptMeetingId !== meetingId && <Button size="sm" variant="outline" onClick={() => openTranscript(run.transcriptMeetingId!)}>Open transcript</Button>}</div></div>}
+    {run && !run.needsRecovery && (run.error || (job && ['failed', 'stopped'].includes(job.state))) && <Button size="sm" variant="outline" disabled={busy || (active && isTerminalJob(job?.state ?? 'stopped'))} onClick={() => void action(() => workflow.retry(run))}>Retry saved transcription</Button>}
+    {meetingId && sessionDir && <details className="text-xs"><summary className="cursor-pointer">Another transcript version</summary><p className="mt-2 text-gray-600">Run the selected model against the same recording. Each version keeps its own corrections.</p><Button size="sm" variant="outline" className="mt-2" disabled={active || busy || !currentProfile?.available || isRecording} onClick={() => void rerun()}>Create another version</Button></details>}
+    {previousJobs.length > 0 && <details className="text-xs"><summary className="cursor-pointer">Saved runs ({previousJobs.length})</summary><div className="mt-2 flex flex-wrap gap-2">{previousJobs.map(previous => <button type="button" key={previous.job_id} disabled={busy} className="rounded border px-2 py-1" onClick={() => void action(async () => { setSelectedJob(previous.job_id); if (meetingId) await workflow.adopt(previous, meetingId); })}>{previous.profile} · {previous.state}</button>)}</div></details>}
+  </section>;
+}

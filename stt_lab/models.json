@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "policy": {
+    "stt_licenses": [
+      "apache-2.0",
+      "mit"
+    ],
+    "offline_inference": true,
+    "max_shipped_stt_models": 2,
+    "release_requires_representative_test_evidence": true,
+    "selected_stt_models": [
+      "apex",
+      "trelis"
+    ],
+    "display_scripts": {
+      "apex": "native_roman",
+      "trelis": "original_devanagari_and_latin_no_transliteration"
+    }
+  },
+  "upstream": {
+    "repository": "https://github.com/Zackriya-Solutions/meetily",
+    "tag": "v0.4.1",
+    "commit": "a2cb62e827da7ef59f65064c97233efb2313878e"
+  },
+  "models": [
+    {
+      "id": "apex",
+      "model_id": "apex",
+      "repo_id": "Oriserve/Whisper-Hindi2Hinglish-Apex",
+      "source_revision": "f3214eed20b4e4d4144e739982d911f87b9cb223",
+      "family": "whisper",
+      "license": "apache-2.0",
+      "role": "live_candidate",
+      "output_script": "roman",
+      "decoding": {
+        "task": "transcribe",
+        "language": "en",
+        "num_beams": 5,
+        "max_new_tokens": 256
+      },
+      "status": "unqualified"
+    },
+    {
+      "id": "trelis",
+      "model_id": "trelis",
+      "repo_id": "Trelis/whisper-hinglish-preview",
+      "source_revision": "eab1188fd2d0e91f2584229b32b3bfe1901c896c",
+      "family": "whisper",
+      "license": "apache-2.0",
+      "role": "quality_candidate",
+      "output_script": "mixed",
+      "decoding": {
+        "task": "transcribe",
+        "language": "hi",
+        "mixed_code_token": "<|mixedcode|>",
+        "max_new_tokens": 440
+      },
+      "status": "unqualified"
+    }
+  ],
+  "excluded": [
+    {
+      "repo_id": "shunyalabs/zero-stt-hinglish",
+      "reason": "OpenRAIL use restrictions and incomplete published license text do not satisfy the selected permissive STT policy."
+    },
+    {
+      "repo_id": "tryorato/orato-asr-hindi-v1",
+      "reason": "Internal/beta-only release conditions and pending data-rights review conflict with unrestricted production admission."
+    },
+    {
+      "repo_id": "Oriserve/Whisper-Hindi2Hinglish-Prime",
+      "reason": "Deferred to bound the initial comparison; not an observed quality failure."
+    }
+  ],
+  "summary": {
+    "enabled": false,
+    "mode": "manual_claude_desktop_handoff",
+    "automatic_upload": false,
+    "automatic_send": false
+  },
+  "application_profiles": {
+    "apex": [15, 20, 30],
+    "trelis": [15, 20]
+  }
+}

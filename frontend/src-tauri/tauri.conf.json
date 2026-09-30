@@ -1,0 +1,120 @@
+{
+    "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+    "productName": "xx",
+    "mainBinaryName": "xx",
+    "version": "0.5.0",
+    "identifier": "com.sttapp.local",
+    "build": {
+        "frontendDist": "../out",
+        "devUrl": "http://localhost:3118",
+        "beforeDevCommand": "pnpm dev",
+        "beforeBuildCommand": "pnpm build"
+    },
+    "app": {
+        "windows": [
+            {
+                "title": "xx",
+                "width": 1240,
+                "height": 800,
+                "minWidth": 960,
+                "minHeight": 600,
+                "preventOverflow": true,
+                "center": true,
+                "backgroundColor": "#fff0f3",
+                "resizable": true,
+                "fullscreen": false,
+                "theme": "Light",
+                "decorations": true
+            }
+        ],
+        "macOSPrivateApi": true,
+        "security": {
+            "csp": {
+                "default-src": "'self'",
+                "style-src": "'self' 'unsafe-inline'",
+                "img-src": "'self' asset: https://asset.localhost data:",
+                "media-src": "'self' asset: http://asset.localhost https://asset.localhost blob:",
+                "connect-src": "'self' ipc: http://ipc.localhost"
+            },
+            "assetProtocol": {
+                "enable": true,
+                "scope": [
+                    "$APPDATA/**"
+                ]
+            },
+            "capabilities": [
+                {
+                    "identifier": "main",
+                    "description": "Main window capability with file system and media access",
+                    "windows": [
+                        "main"
+                    ],
+                    "permissions": [
+                        "fs:default",
+                        "fs:allow-read-file",
+                        "fs:allow-write-text-file",
+                        "dialog:allow-save",
+                        "fs:read-all",
+                        "fs:write-all",
+                        "fs:allow-app-read",
+                        "fs:allow-app-write",
+                        "fs:allow-download-write",
+                        "fs:allow-download-read",
+                        "fs:scope-download",
+                        "core:path:default",
+                        "core:event:default",
+                        "core:window:default",
+                        "core:app:default",
+                        "core:resources:default",
+                        "core:menu:default",
+                        "core:tray:default",
+                        "core:window:allow-set-title",
+                        "store:default",
+                        "notification:default",
+                        "notification:allow-is-permission-granted",
+                        "process:default",
+                        {
+                            "identifier": "fs:scope",
+                            "allow": [
+                                {
+                                    "path": "$APPDATA/*"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+    },
+    "bundle": {
+        "active": true,
+        "publisher": "xx",
+        "shortDescription": "I listen and I don't judge",
+        "targets": [
+            "deb",
+            "appimage",
+            "msi",
+            "nsis",
+            "app",
+            "dmg"
+        ],
+        "createUpdaterArtifacts": false,
+        "icon": [
+            "icons/icon.png",
+            "icons/app_icon.icns",
+            "icons/app_icon.ico"
+        ],
+        "resources": [
+            "templates/*.json"
+        ],
+        "externalBin": [
+            "binaries/ffmpeg"
+        ],
+        "macOS": {
+            "entitlements": "entitlements.plist",
+            "signingIdentity": "-",
+            "hardenedRuntime": true
+        }
+    },
+    "plugins": {}
+}

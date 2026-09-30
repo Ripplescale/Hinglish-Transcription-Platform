@@ -1,0 +1,143 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+/experiments
+
+# dependencies
+/node_modules
+**/models
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+*.mp4
+
+# testing
+/coverage
+/dist
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# Audio files
+*.wav
+
+# Large media files
+docs/demo.mov
+docs/demo.gif
+
+
+meeting_minutes.db
+
+# Added by Task Master AI
+# Logs
+logs
+*.log
+dev-debug.log
+# Dependency directories
+node_modules/
+# Environment variables
+.env
+# Editor directories and files
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+experiments/
+.cursor/
+target/
+
+frontend/src-tauri/binaries/
+
+# STT research: user audio, model weights, private transcripts and environments
+__pycache__/
+*.py[cod]
+.venv/
+*.safetensors
+*.gguf
+*.ggml
+*.flac
+*.mp3
+*.m4a
+/stt_lab/private/
+/stt_lab/runs/
+
+# Local-only evidence and generated review artifacts. Preserve these on disk.
+/STT_START_HERE.md
+/stt_lab/LOCAL_APP_WORKFLOW.md
+/stt_lab/paced-synthetic-*/
+**/test-artifacts/
+**/test-results/
+**/playwright-report/
+**/recordings/
+**/transcripts/
+**/exports/
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.webm
+*.ogg
+*.aac
+*.wma
+*.avi
+*.mkv
+*.mov
+*.onnx
+*.pt
+*.pth
+*.ckpt
+.env.*
+!.env.example
+!.env.sample
+*.local.json
+sttapp-local-install.json
+*.exe
+*.dll
+*.bin
+*.env
+!*.env.example
+!*.env.sample
+
+# Historical, call-specific research notes/tools stay private on this machine.
+/stt_lab/BOUNDARY_PILOT.md
+/stt_lab/CAPTURE_NEXT.md
+/stt_lab/CHUNK_SIZE_STUDY.md
+/stt_lab/SUSTAINED_REPLAY.md
+/stt_lab/tools/create_comparison_doc.py
+/stt_lab/tools/diagnose_lexical_errors.py
+/stt_lab/tools/probe_quantity_prefix.py
+/stt_lab/tools/render_lexical_findings.py
+/stt_lab/tools/render_docx_windows.ps1

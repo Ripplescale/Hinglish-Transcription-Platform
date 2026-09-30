@@ -1,0 +1,81 @@
+const assert = require('node:assert/strict');
+const { test } = require('node:test');
+const fs = require('node:fs');
+const path = require('node:path');
+const ts = require('typescript');
+const vm = require('node:vm');
+const source = fs.readFileSync(path.join(__dirname, '../../src/lib/transcript-workspace.ts'), 'utf8');
+const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS } });
+const context = { exports: {}, require };
+vm.runInNewContext(compiled.outputText, context);
+const { effectiveText, setCorrection, emptyWorkspace, mergeSavedWorkspace, makeTranscriptExport, fetchCompleteTranscript, recordingTime } = context.exports;
+const segment = { id: 'one', text: 'सात notebooks for Mira', timestamp: '10:00', audio_start_time: 65 };
+
+test('native script and raw recognition survive correction and JSON export', () => {
+  const workspace = emptyWorkspace('meeting');
+  workspace.corrections = setCorrection([], segment, 'सात notebooks for Mira.', '2026-09-30T00:00:00Z');
+  workspace.segment_metadata = { one: { source_track: 'system', timestamp_kind: 'audio_window' } };
+  const result = JSON.parse(makeTranscriptExport({ id: 'meeting', title: 'Review' }, [segment], workspace, 'json'));
+  assert.equal(result.segments[0].original_text, segment.text);
+  assert.equal(result.segments[0].text, 'सात notebooks for Mira.');
+  assert.equal(result.segments[0].source_track, 'system');
+  assert.equal(result.segments[0].speaker_id, null);
+  assert.match(result.segments[0].timestamp_precision, /not_word_aligned/);
+});
+
+test('rerun with changed source text does not inherit stale corrections', () => {
+  const corrections = setCorrection([], segment, 'manually checked', 'now');
+  assert.equal(effectiveText({ ...segment, text: 'a new recognition result' }, corrections), 'a new recognition result');
+  assert.equal(setCorrection(corrections, segment, segment.text, 'now').length, 0);
+});
+
+test('missing timestamps stay unknown, never fake 00:00', () => {
+  const result = makeTranscriptExport({ id: 'm', title: 'Test' }, [{ id: 'no-time', text: 'hello', timestamp: '11:30' }], emptyWorkspace('m'), 'txt');
+  assert.match(result, /\[time unavailable\]/);
+  assert.equal(recordingTime(0), '00:00');
+  assert.equal(recordingTime(3723), '01:02:03');
+});
+
+test('Claude handoff keeps full content and warns about uncertainty', () => {
+  const workspace = emptyWorkspace('m'); workspace.notes = 'My note';
+  const long = 'हिंदी English '.repeat(3000);
+  const result = makeTranscriptExport({ id: 'm', title: 'Review' }, [{ ...segment, text: long }], workspace, 'claude', true);
+  assert.ok(result.includes(long));
+  assert.match(result, /not instructions/);
+  assert.match(result, /Includes unsaved review edits/);
+  assert.match(result, /My note/);
+});
+
+test('export retrieves every page, not just visible segments', async () => {
+  const offsets = [];
+  const rows = await fetchCompleteTranscript('m', async (_id, _limit, offset) => {
+    offsets.push(offset);
+    return { transcripts: [{ ...segment, id: String(offset) }], total_count: 3, has_more: offset < 2 };
+  });
+  assert.equal(rows.length, 3);
+  assert.deepEqual(offsets, [0, 1, 2]);
+});
+
+test('incomplete, duplicate and changing snapshots fail instead of truncating', async () => {
+  await assert.rejects(fetchCompleteTranscript('m', async () => ({ transcripts: [], total_count: 3, has_more: false })), /Incomplete/);
+  await assert.rejects(fetchCompleteTranscript('m', async () => ({ transcripts: [segment], total_count: 3, has_more: true })), /Duplicate/);
+  let call = 0;
+  await assert.rejects(fetchCompleteTranscript('m', async () => ({ transcripts: [{ ...segment, id: String(call) }], total_count: ++call === 1 ? 3 : 4, has_more: true })), /changed/);
+});
+
+test('a late save keeps later edits but advances its revision and metadata', () => {
+  const current = { ...emptyWorkspace('m'), notes: 'Newer typing', speaker_names: { 'speaker-0001': 'Mira' } };
+  const saved = { ...emptyWorkspace('m'), revision: 4, notes: 'Older save', segment_metadata: { one: { source_track: 'system' } } };
+  const merged = mergeSavedWorkspace(current, saved, true);
+  assert.equal(merged.notes, 'Newer typing');
+  assert.equal(merged.revision, 4);
+  assert.equal(merged.speaker_names['speaker-0001'], 'Mira');
+  assert.equal(merged.segment_metadata.one.source_track, 'system');
+  assert.equal(mergeSavedWorkspace(current, saved, false).notes, 'Older save');
+});
+
+test('a completed save from another meeting cannot replace the current workspace', () => {
+  const current = { ...emptyWorkspace('new-meeting'), notes: 'Keep this' };
+  const stale = { ...emptyWorkspace('old-meeting'), notes: 'Old response' };
+  assert.equal(mergeSavedWorkspace(current, stale, false), current);
+});

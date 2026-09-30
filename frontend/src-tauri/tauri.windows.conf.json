@@ -1,0 +1,12 @@
+{
+  "bundle": {
+    "resources": {
+      "templates": "templates",
+      "binaries/onnxruntime": ".",
+      "binaries/msvc-runtime": ".",
+      "INSTALL-WINDOWS.txt": "INSTALL-WINDOWS.txt",
+      "scripts/Start-xx.ps1": "Start-xx.ps1",
+      "binaries/sttapp-local-install.json": "sttapp-local-install.json"
+    }
+  }
+}
