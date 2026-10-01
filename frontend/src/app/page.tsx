@@ -187,7 +187,7 @@ export default function Home() {
       <TranscriptRecovery isOpen={showRecoveryDialog} onClose={handleDialogClose} recoverableMeetings={recoverableMeetings} onRecover={handleRecovery} onDelete={deleteRecoverableMeeting} onLoadPreview={loadMeetingTranscripts} />
       <div className="xx-home-sheet xx-paper">
         <details className="xx-recording-options shrink-0 border-b border-[var(--xx-border)]">
-          <summary className="flex cursor-pointer items-center gap-2 px-6 py-3 text-xs text-[var(--xx-muted)]"><SlidersHorizontal size={14} />Recording options<span className="ml-auto">Automatic · Apex draft → Trelis final</span></summary>
+          <summary className="flex cursor-pointer items-center gap-2 px-6 py-3 text-xs text-[var(--xx-muted)]"><SlidersHorizontal size={14} />Recording options<span className="ml-auto">Trelis live · Apex fallback</span></summary>
           <div className="max-h-[38vh] overflow-y-auto px-5 pb-4"><LocalTranscriptionPanel /></div>
         </details>
         <LiveTranscriptPanel />

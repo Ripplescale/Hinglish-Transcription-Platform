@@ -9,21 +9,22 @@ Run the locally supplied xx setup program, then open **xx** from Start. Close th
 The install includes the desktop application, FFmpeg, and required Microsoft C++ runtime files. It reuses the existing local models and Python environments. Its adjacent `sttapp-local-install.json` points to the data root; do not commit this machine-specific file.
 
 1. Check the local runtime status, microphone, and system-audio device.
-2. Choose the call language. New recordings use **Apex · 20 seconds** for a Roman Hinglish **Live Draft**, followed automatically by **Trelis · 20 seconds** for the original-script **Final** after stopping.
-3. Record a short test. Stop, let Apex finish its current window and exit, then let Trelis process the saved audio. Check playback and the transcript before relying on a longer call.
-4. Review the Final and edit text or speakers where needed. “Final” is an unreviewed machine transcript until you check it. Copy/export into Claude only when you want to review and send it yourself.
+2. Choose the call language. New recordings use **Trelis · 20 seconds · OpenVINO GPU FP16** for the live transcript, preserving original Hindi/English script. Model loading adds startup time, and each update takes a 20-second window plus processing time.
+3. Record a short test. Stop and let the same job finish remaining audio; there is no second full pass. Check playback and the transcript before relying on a longer call.
+4. If Trelis needs attention, choose **Use Apex fallback**. The app pauses Trelis after its current window and imports its last output before Apex replays the saved audio as a separate version. GPU errors are shown, without a silent Trelis CPU fallback.
+5. Review the transcript and edit text or speakers where needed. “Final transcript” means processing completed, not that a person checked it. Copy/export into Claude only when you want to review and send it yourself.
 
-The Live Draft is for following the conversation and may be incomplete. Its saved output remains available alongside the Final. Corrections and notes stay with the version you edited; they are not silently copied between models. Additional manual versions remain available through Tools.
+Trelis live text may lag or be incomplete. Its raw output and checkpoint remain available if you switch to Apex. Corrections and notes stay with the version you edited; they are not silently copied between models. Additional manual versions remain available through Tools.
 
-One heavy worker runs at a time. Back-to-back calls keep recording while earlier work finishes; a delayed Live Draft can be skipped once that call stops, and its Final can still use the saved audio. Pausing a worker does not stop capture, and a paused or failed Final needs an explicit retry. Existing legacy versions remain unchanged.
+One heavy worker runs at a time. Back-to-back calls keep recording while earlier work finishes; a delayed Trelis job can still use all saved audio. Pausing a worker does not stop capture. After choosing Apex fallback, Trelis stays paused until you explicitly retry it after Apex has finished or paused. Existing legacy versions, including the older two-pass workflow, remain unchanged.
 
-This unsigned local installer does not use Meetily's upstream updater. Trelis on the current CPU setup runs after the call. Optional speaker setup is described below.
+This unsigned local installer does not use Meetily's upstream updater. The new default requires a verified OpenVINO GPU runtime; the older CPU configuration is not a qualified live configuration. Optional speaker setup is described below.
 
 ## Developer prerequisites
 
 Use PowerShell 7, Git, Node.js 22, pnpm, and Windows x64 CPython 3.12. The private Python-copy helper is pinned to the tested **3.12.14** base. Build the native app with Rust's **MSVC** target, Microsoft C++ Build Tools and a Windows SDK; the bundled ONNX build step does not support the GNU target.
 
-Use a local data directory outside OneDrive. The tested machine has 32 GB RAM and an Intel Vulkan-capable GPU; that is a description of the tested configuration, not an established minimum requirement. Leave headroom for the calling app and run only one heavy model job at a time. Dependency/model setup needs the network and substantial disk space; installed transcription can run offline.
+Use a local data directory outside OneDrive. The acceleration experiment used a 32 GB laptop with an Intel Ultra 7 268V and Arc 140V GPU; that is a tested engine configuration, not an established minimum requirement or complete-app hardware qualification. Leave headroom for the calling app and run only one heavy model job at a time. Dependency/model setup needs the network and substantial disk space; installed transcription can run offline.
 
 ```powershell
 git clone https://github.com/Ripplescale/Hinglish-Transcription-Platform.git
@@ -58,6 +59,8 @@ The expected paths below follow that guide. Use your actual verified executable 
 
 ## Configure and install the ASR worker
 
+Create the baseline CPU/Apex configuration first, then prepare OpenVINO in the next section. The OpenVINO preparation helper needs the existing original Trelis configuration and its verified checkpoint. **Do not use this baseline as the new live Trelis configuration.**
+
 Create a private configuration directory. The installer's historical `--study` argument means a directory containing `configs/apex.json` and `configs/trelis.json`; it does not require a benchmark or private call data.
 
 ```powershell
@@ -84,7 +87,40 @@ $utf8 = [Text.UTF8Encoding]::new($false)
   --data-root $sttRoot --study $sttConfig --python $sttPython
 ```
 
-This writes a content-addressed copy of the worker and `runtime.json`. It does not copy recordings or download weights. Paths and asset provenance are validated during inference. Keep the original checkpoint and conversion records outside Git. Test a short local recording before claiming deployment success.
+This writes a content-addressed copy of the worker and `runtime.json`. It does not copy recordings or download weights. Paths and asset provenance are validated during inference. Keep the original checkpoint and conversion records outside Git.
+
+## Prepare Trelis OpenVINO GPU
+
+The GPU path uses a separate, independently installed environment. The experimental environment that borrowed dependencies from another environment is not a deployment dependency. The pinned lock includes Python **3.12.14**, torch **2.8.0+cpu**, transformers **4.57.6**, optimum-intel **2.2.0**, optimum **2.3.0**, and OpenVINO **2026.4.0**. CPU torch is used by the export/runtime support code; OpenVINO performs inference explicitly on the GPU.
+
+Use your verified CPython 3.12.14 executable as `$basePython`:
+
+```powershell
+& $basePython -B stt_lab/tools/bootstrap_openvino.py `
+  --data-root $sttRoot --base-python $basePython
+$ovPython = Join-Path $sttLab 'venvs\openvino-py312\Scripts\python.exe'
+```
+
+The bootstrap installs exact versions from [`openvino-windows-py312.lock.txt`](../stt_lab/tools/openvino-windows-py312.lock.txt), checks dependencies and GPU availability, and records wheel hashes. It does not activate the app runtime. `--pip-cache` can select a download cache; use `--direct` only if your network setup requires bypassing proxy environment variables for these downloads.
+
+Next supply an **existing verified FP16 OpenVINO export** of Trelis revision `eab1188fd2d0e91f2584229b32b3bfe1901c896c`. The example path below is a placeholder: it must contain the encoder and decoder IR files, original tokenizer/processor assets, and the matching `export-complete.json` hash record.
+
+```powershell
+$verifiedExport = 'C:\LocalModels\trelis-openvino-fp16' # replace with your verified export directory
+& $ovPython -B stt_lab/tools/prepare_openvino_runtime.py `
+  --data-root $sttRoot --export-source $verifiedExport --python $ovPython
+```
+
+This stages durable model files, worker source, and a candidate runtime configuration without activating it. The current export was produced by the reproducible local acceleration experiment using a stateful `automatic-speech-recognition-with-past` export, FP16, and the original tokenizer. A standalone general export/download installer is not provided yet; the repository contains neither converted weights nor private benchmark inputs. Fresh-machine setup remains a developer procedure, not one click.
+
+After checking the candidate and stopping capture and worker processes, activate explicitly:
+
+```powershell
+& $ovPython -B stt_lab/tools/prepare_openvino_runtime.py `
+  --data-root $sttRoot --export-source $verifiedExport --python $ovPython --activate
+```
+
+Activation must retain the original CPU configuration for older jobs and Apex's separate engine. Keep the source checkpoint, export hashes, and environment setup report. Test the actual app's two-track recording-to-transcript path, fallback, recovery, and corrections before treating the installation as qualified. GPU model startup is additional to warm processing; quiet input, two active tracks, retries, and speaker processing can change elapsed time substantially. See [the benchmark limits](HOW_IT_WORKS.md#models-and-timing).
 
 ## Optional speaker identification
 
@@ -133,7 +169,8 @@ Moving data requires updating absolute recording/model/worker/environment paths 
 
 - **Runtime unavailable:** verify the data pointer, `runtime.json`, Python executable, and model/configuration paths.
 - **Speaker access denied:** use the same account for the access form and local login; preserve a working configuration while retrying setup.
-- **Trelis queues slowly:** keep it after-call and avoid concurrent memory-heavy jobs. It is not currently a live CPU profile.
+- **OpenVINO GPU unavailable:** check the independent environment and GPU driver/runtime. Recording remains available; choose the explicit Apex fallback or repair setup and retry. Do not silently change Trelis to CPU.
+- **Trelis queues slowly:** check whether another heavy worker is active and leave memory/GPU headroom for the call. Twenty-second windows still need processing time, and both tracks cost work. The actual 90-minute app flow is not yet qualified.
 - **Missing speech:** check the saved track and input levels, then inspect flags/retry alternatives. Re-running cannot restore missing captured audio.
 - **Build failure on GNU Rust:** use the MSVC toolchain required by the pinned native ONNX packaging step.
 

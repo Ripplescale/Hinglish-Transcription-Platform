@@ -163,9 +163,9 @@ async function main() {
     assert.equal(await page.getByLabel('Transcription timing').count(), 0);
     assert.equal(await page.getByLabel('Recording language').count(), 1);
     assert.equal(await page.getByLabel('Recording language').inputValue(), 'hinglish', 'Manual version settings do not change the next recording');
-    await page.getByText('Apex live draft', { exact: false }).first().waitFor();
+    await page.getByText('Trelis live transcript', { exact: false }).first().waitFor();
     await page.locator('summary').filter({ hasText: /^Recording options/ }).click();
-    report.checks.push('New recordings use the automatic Apex-to-Trelis workflow with language as the only option');
+    report.checks.push('New recordings use Trelis live with explicit Apex fallback and language as the only option');
     for (const [width, height] of [[1440,900], [1366,768], [1280,720], [1024,768]]) {
       await page.setViewportSize({ width, height });
       const start = await page.getByRole('button', { name: 'Start recording', exact: true }).boundingBox();

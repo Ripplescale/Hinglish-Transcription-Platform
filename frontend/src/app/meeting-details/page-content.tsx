@@ -40,6 +40,7 @@ export default function PageContent({ meeting, summaryData, onMeetingUpdated, ha
   const router = useRouter();
   const review = useTranscriptWorkspace(meeting.id);
   const draftNotes = 'workflow_role' in review.workspace && review.workspace.workflow_role === 'live-draft';
+  const fallbackNotes = review.workspace.workflow_role === 'fallback';
   const legacy = useMeetingData({ meeting, summaryData, onMeetingUpdated });
   const save = async () => {
     try { await review.save(); toast.success('Notes and corrections saved'); }
@@ -132,7 +133,7 @@ export default function PageContent({ meeting, summaryData, onMeetingUpdated, ha
       transcript={<TranscriptWorkspacePanel meeting={meeting} review={review} hasMore={hasMore} isLoadingMore={isLoadingMore} totalCount={totalCount} onLoadMore={onLoadMore} onDraftChange={setCorrectionDraft} />}
       summary={<section className="flex h-full min-h-0 min-w-0 flex-col bg-[var(--xx-paper)] text-[var(--xx-ink)]" aria-label="Meeting notes">
         <header className="shrink-0 px-5 pt-5 pb-4 border-b border-[var(--xx-border)] space-y-4">
-          <div className="flex items-center justify-between gap-2"><h2 className="xx-eyebrow flex items-center gap-2"><NotebookPen size={13} aria-hidden="true" />{draftNotes ? 'Notes for this draft' : 'My notes'}</h2>
+          <div className="flex items-center justify-between gap-2"><h2 className="xx-eyebrow flex items-center gap-2"><NotebookPen size={13} aria-hidden="true" />{fallbackNotes ? 'Notes for this fallback' : draftNotes ? 'Notes for this draft' : 'My notes'}</h2>
             <Popover><PopoverTrigger asChild><button type="button" className="xx-button-secondary !min-h-8 !px-2 text-xs"><Settings2 size={13} aria-hidden="true" />Tools<ChevronDown size={12} aria-hidden="true" /></button></PopoverTrigger>
               <ToolsPortal forceMount><ToolsContent forceMount align="end" sideOffset={10} aria-label="Meeting tools" className="data-[state=closed]:hidden z-50 border shadow-lg outline-none w-[380px] max-h-[min(680px,calc(100vh-120px))] overflow-y-auto rounded-2xl border-[var(--xx-border)] bg-[var(--xx-paper)] p-4 text-[var(--xx-ink)] space-y-3">
                 <div><h3 className="font-medium text-sm">Meeting tools</h3><p className="mt-1 text-xs text-[var(--xx-muted)]">Fine-tune this meeting when you need to.</p></div>
@@ -147,7 +148,7 @@ export default function PageContent({ meeting, summaryData, onMeetingUpdated, ha
         </header>
         {review.error && <p role="alert" className="mx-5 mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-700">{review.error}</p>}
         <textarea aria-label="Meeting notes" placeholder={'A little space for your thoughts.\n\nJot down ideas, decisions or next steps — or paste your refined summary here.'} className="flex-1 min-h-0 w-full resize-none border-0 bg-transparent p-5 text-[15px] leading-[1.9] placeholder:text-[var(--xx-muted)] focus:outline-none focus-visible:shadow-[inset_0_0_0_2px_var(--xx-border)]" disabled={!review.loaded} value={review.workspace.notes} onChange={event => review.updateNotes(event.target.value)} />
-        <footer className="shrink-0 px-5 py-3 border-t border-[var(--xx-border)] text-[11px] text-[var(--xx-muted)] flex items-center justify-between gap-2"><span>{draftNotes ? 'Notes and corrections stay with this version.' : 'Your notes, in your words.'}</span><kbd className="shrink-0 rounded border border-[var(--xx-border)] px-1.5 py-0.5 text-[10px]">Ctrl S to save</kbd></footer>
+        <footer className="shrink-0 px-5 py-3 border-t border-[var(--xx-border)] text-[11px] text-[var(--xx-muted)] flex items-center justify-between gap-2"><span>{draftNotes || fallbackNotes ? 'Notes and corrections stay with this version.' : 'Your notes, in your words.'}</span><kbd className="shrink-0 rounded border border-[var(--xx-border)] px-1.5 py-0.5 text-[10px]">Ctrl S to save</kbd></footer>
       </section>} />
     <Dialog open={pendingNavigation !== null} onOpenChange={open => { if (!open) setPendingNavigation(null); }}><DialogContent className="rounded-2xl border-[var(--xx-border)] bg-[var(--xx-paper)] text-[var(--xx-ink)] max-w-sm"><DialogHeader><DialogTitle>Keep your changes?</DialogTitle><DialogDescription className="text-[var(--xx-muted)]">This meeting has unsaved notes or corrections. Stay here to save them before leaving.</DialogDescription></DialogHeader><DialogFooter className="gap-2"><button className="xx-button-secondary text-sm" onClick={() => {
       const next = pendingNavigation; setPendingNavigation(null);

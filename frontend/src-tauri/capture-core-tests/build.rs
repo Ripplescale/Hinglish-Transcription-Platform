@@ -39,4 +39,19 @@ fn main() {
     )).collect();
     assert_eq!(tests.len(), 2, "Automatic-workflow assertions must stay linked to production tests");
     fs::write(PathBuf::from(env::var("OUT_DIR").unwrap()).join("automatic_workflow.rs"), quote!(#(#helpers)* #(#tests)*).to_string()).unwrap();
+    let snapshot_helpers: Vec<_> = parsed.items.iter().filter(|item| matches!(item,
+        syn::Item::Fn(function) if ["read", "validate_asr_runtime", "ensure_job_runtime_snapshot"].contains(&function.sig.ident.to_string().as_str())
+    )).collect();
+    assert_eq!(snapshot_helpers.len(), 3, "Runtime snapshot helpers must be extracted from production source");
+    let snapshot_tests: Vec<_> = parsed.items.iter().filter_map(|item| match item {
+        syn::Item::Mod(module) if module.ident == "tests" => module.content.as_ref().map(|(_, items)| items),
+        _ => None,
+    }).flatten().filter(|item| matches!(item,
+        syn::Item::Fn(function) if ["synthetic_asr_runtime", "asr_runtime_snapshot_keeps_old_runtime_after_global_change",
+            "asr_runtime_snapshot_rejects_invalid_or_missing_files_without_replacement",
+            "legacy_asr_checkpoint_requires_original_runtime_migration", "concurrent_asr_snapshot_creation_has_one_complete_winner"
+        ].contains(&function.sig.ident.to_string().as_str())
+    )).collect();
+    assert_eq!(snapshot_tests.len(), 5, "Runtime snapshot assertions must stay linked to production tests");
+    fs::write(PathBuf::from(env::var("OUT_DIR").unwrap()).join("runtime_snapshots.rs"), quote!(#(#snapshot_helpers)* #(#snapshot_tests)*).to_string()).unwrap();
 }

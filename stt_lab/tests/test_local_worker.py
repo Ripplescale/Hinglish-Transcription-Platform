@@ -147,5 +147,29 @@ class LocalWorkerTests(unittest.TestCase):
                 with worker.job_lock(path): self.fail('Second writer entered')
         with worker.job_lock(path): pass
 
+    def test_gpu_warmup_emits_no_transcript_and_failure_keeps_audio(self):
+        row = self.chunk(0, np.zeros(16000))
+        self.journal([row, {'kind':'capture_stopped','at_seconds':1}, {'kind':'capture_finalized'}])
+        registry = self.root/'models.json'
+        write_json(registry, {'models':[{'id':'trelis','decoding':{}}]})
+        config = self.root/'runtime.json'
+        write_json(config, {'registry_path':str(registry),'models':{'trelis':{'backend':'openvino'}}})
+        before = file_digest(self.session/row['file'])
+        for failed in (False, True):
+            job = self.root/str(failed); job.mkdir()
+            request = job/'request.json'
+            write_json(request, {'job_id':'warmup','session_dir':str(self.session),'profile':'trelis-20','language_mode':'hinglish'})
+            def load(spec, runtime):
+                checkpoint = read_json(job/'status.json')
+                self.assertEqual(checkpoint['phase'], 'loading_model')
+                self.assertEqual(checkpoint['segments'], [])
+                return {'status':'failed' if failed else 'ok','text':'','segments':[], 'error':'synthetic failure' if failed else None}
+            with patch.object(socket.socket,'connect',socket.socket.connect), patch.object(socket.socket,'connect_ex',socket.socket.connect_ex), patch.object(socket,'create_connection',socket.create_connection), patch.object(worker,'parent_alive',return_value=True), patch.object(worker,'warmup',side_effect=load) as warm:
+                result = worker.run(config, request)
+            warm.assert_called_once()
+            self.assertEqual(result['state'], 'failed' if failed else 'complete')
+            self.assertEqual(len(result['segments']), 0 if failed else 1)
+            self.assertEqual(file_digest(self.session/row['file']), before)
+
 
 if __name__ == '__main__': unittest.main()

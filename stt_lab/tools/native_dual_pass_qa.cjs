@@ -52,7 +52,7 @@ async function main() {
 
     await assert.rejects(() => invoke('start_local_transcription', { ...startArgs('final'),
       sessionDir: fixture.unfinished_session.session_dir }), /Finalize or recover/);
-    await assert.rejects(() => invoke('start_local_transcription', { ...startArgs('final'), profile: 'apex-20' }), /automatic workflow/);
+    await assert.rejects(() => invoke('start_local_transcription', { ...startArgs('final'), profile: 'apex-20' }), /Use Trelis 20s/);
     checked('Final pass rejects unfinished captures and swapped role/model combinations');
 
     const baseSaved = await save(meeting.meeting_id, await workspace(meeting.meeting_id), { notes: 'Source notes stay with the final transcript.' });

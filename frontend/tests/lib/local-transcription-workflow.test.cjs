@@ -71,6 +71,15 @@ function fixture(previous) {
   };
   const result = {
     workflow: new LocalWorkflow(dependencies, previous), calls, imports, stops, jobs, speakers, meetings, bindings,
+    startLegacyCapture: async (session) => {
+      if (!result.runs(session).length) for (const role of ['live-draft', 'final']) result.workflow.state.runs.push({
+        capture: session, role, primary: role === 'final', recording: false,
+        preferences: { profile: role === 'final' ? 'trelis-20' : 'apex-20', timing: role === 'final' ? 'after-recording' : 'during-recording', languageMode: 'hinglish' },
+      });
+      return result.workflow.captureStarted(session);
+    },
+    live: (session = capture) => result.runs(session).find(run => run.role === 'live-final'),
+    fallback: (session = capture) => result.runs(session).find(run => run.role === 'fallback'),
     count: command => calls.filter(call => call.command === command).length,
     runs: (session = capture) => result.workflow.state.runs.filter(run => run.capture.session_id === session.session_id),
     draft: (session = capture) => result.runs(session).find(run => run.role === 'live-draft'),
@@ -92,21 +101,21 @@ async function finishDraft(f, values = {}) {
   f.status(f.draft(), { state: 'stopped', ...values }); await f.workflow.tick();
 }
 async function startFinal(f) {
-  await f.workflow.captureStarted(capture); await f.workflow.captureStopped(capture); await finishDraft(f);
+  await f.startLegacyCapture(capture); await f.workflow.captureStopped(capture); await finishDraft(f);
   assert.ok(f.final().job); return f.final();
 }
 
 test('new recording defaults migrate profile/timing while preserving language and legacy run settings', () => {
   const preferences = readPreferences({ profile: 'trelis-15', timing: 'after-recording', languageMode: 'english' });
-  assert.equal(preferences.profile, 'apex-20'); assert.equal(preferences.timing, 'during-recording'); assert.equal(preferences.languageMode, 'english');
+  assert.equal(preferences.profile, 'trelis-20'); assert.equal(preferences.timing, 'during-recording'); assert.equal(preferences.languageMode, 'english');
   assert.equal(pathKey('\\\\?\\C:\\STTApp\\recordings\\one'), pathKey(capture.session_dir));
   const old = { capture, recording: false, primary: true, preferences: { profile: 'trelis-20', timing: 'after-recording', languageMode: 'hinglish' } };
   const f = fixture({ preferences, runs: [old] });
   assert.equal(f.workflow.state.runs[0].preferences.profile, 'trelis-20'); assert.equal(f.workflow.state.runs[0].role, undefined);
 });
 
-test('fresh capture creates one base meeting and distinct draft/final records but only starts Apex', async () => {
-  const f = fixture(); await f.workflow.captureStarted(capture);
+test('existing dual-pass capture keeps one base meeting and distinct draft/final records', async () => {
+  const f = fixture(); await f.startLegacyCapture(capture);
   assert.equal(f.runs().length, 2); assert.equal(f.count('ensure_capture_meeting'), 1); assert.equal(f.count('start_local_transcription'), 1);
   assert.equal(f.draft().preferences.profile, 'apex-20'); assert.equal(f.draft().primary, false);
   assert.equal(f.final().preferences.profile, 'trelis-20'); assert.equal(f.final().primary, true);
@@ -116,7 +125,7 @@ test('fresh capture creates one base meeting and distinct draft/final records bu
 });
 
 test('duplicate events request one graceful handoff, import the final draft checkpoint, then start distinct Final', async () => {
-  const f = fixture(); await Promise.all([f.workflow.captureStarted(capture), f.workflow.captureStarted(capture)]);
+  const f = fixture(); await Promise.all([f.startLegacyCapture(capture), f.startLegacyCapture(capture)]);
   const raw = segment(); f.status(f.draft(), { segments: [raw] }); await f.workflow.tick();
   const draftId = f.draft().job.job_id, childId = f.draft().transcriptMeetingId;
   await Promise.all([f.workflow.captureStopped(capture), f.workflow.captureStopped(capture)]);
@@ -131,19 +140,19 @@ test('duplicate events request one graceful handoff, import the final draft chec
   assert.ok(importAt < finalAt); assert.equal(f.draft().importedCount, 2); assert.equal(f.draft().importedState, 'stopped');
   f.status(f.final(), { segments: [segment('final-own-id', 'मीरा ने सात notebooks कहे')] }); await f.workflow.tick();
   assert.equal(f.final().transcriptMeetingId, f.final().meetingId); assert.notEqual(f.final().transcriptMeetingId, childId);
-  await f.workflow.captureStarted(capture); await f.workflow.captureStopped(capture);
+  await f.startLegacyCapture(capture); await f.workflow.captureStopped(capture);
   assert.equal(f.runs().length, 2); assert.equal(f.count('start_local_transcription'), 2); assert.equal(f.stops.length, 1);
 });
 
 test('a terminal checkpoint masked as running does not release the model slot early', async () => {
-  const f = fixture(); await f.workflow.captureStarted(capture); await f.workflow.captureStopped(capture);
+  const f = fixture(); await f.startLegacyCapture(capture); await f.workflow.captureStopped(capture);
   f.status(f.draft(), { state: 'running', checkpoint_state: 'stopped' }); await f.workflow.tick();
   assert.equal(f.final().job, undefined);
   await finishDraft(f); assert.ok(f.final().job);
 });
 
 test('failed draft import blocks handoff and explicit retry repairs import without resuming Apex', async () => {
-  const f = fixture(); await f.workflow.captureStarted(capture); await f.workflow.captureStopped(capture);
+  const f = fixture(); await f.startLegacyCapture(capture); await f.workflow.captureStopped(capture);
   f.failImport(f.draft()); await finishDraft(f, { segments: [segment()] });
   assert.equal(f.final().job, undefined); assert.match(f.draft().error, /import failure/);
   await f.workflow.tick(); assert.equal(f.final().job, undefined);
@@ -152,7 +161,7 @@ test('failed draft import blocks handoff and explicit retry repairs import witho
 });
 
 test('Apex start failure never blocks saved capture or the Final stage', async () => {
-  const f = fixture(); f.failStart('live-draft'); await f.workflow.captureStarted(capture);
+  const f = fixture(); f.failStart('live-draft'); await f.startLegacyCapture(capture);
   assert.equal(f.draft().recording, true); assert.match(f.draft().error, /unavailable/);
   await f.workflow.captureStopped(capture);
   assert.equal(f.draft().draftSkipped, true); assert.equal(f.draft().job, undefined); assert.ok(f.final().job);
@@ -160,31 +169,31 @@ test('Apex start failure never blocks saved capture or the Final stage', async (
 });
 
 test('failed Apex with an empty saved checkpoint can hand off to Final', async () => {
-  const f = fixture(); await f.workflow.captureStarted(capture);
+  const f = fixture(); await f.startLegacyCapture(capture);
   f.status(f.draft(), { state: 'failed', segments: [], error: 'synthetic decoder failure' });
   await f.workflow.captureStopped(capture);
   assert.equal(f.draft().importedState, 'failed'); assert.equal(f.draft().importedCount, 0); assert.ok(f.final().job);
 });
 
 test('an eligible Final gets the free worker before another unstarted live Draft', async () => {
-  const f = fixture(); await f.workflow.captureStarted(capture); await f.workflow.captureStopped(capture);
-  await f.workflow.captureStarted(second); assert.equal(f.draft(second).job, undefined);
+  const f = fixture(); await f.startLegacyCapture(capture); await f.workflow.captureStopped(capture);
+  await f.startLegacyCapture(second); assert.equal(f.draft(second).job, undefined);
   await finishDraft(f);
   assert.ok(f.final().job); assert.equal(f.draft(second).job, undefined);
   assert.equal(f.calls.filter(call => call.command === 'start_local_transcription')[1].args.workflowRole, 'final');
 });
 
 test('missed live Draft stays visibly skipped after stop and is never backfilled', async () => {
-  const f = fixture(); await startFinal(f); await f.workflow.captureStarted(second); await f.workflow.captureStopped(second);
+  const f = fixture(); await startFinal(f); await f.startLegacyCapture(second); await f.workflow.captureStopped(second);
   assert.equal(f.draft(second).draftSkipped, true); assert.equal(f.draft(second).job, undefined);
-  await f.workflow.captureStarted(third);
+  await f.startLegacyCapture(third);
   f.status(f.final(), { state: 'complete' }); await f.workflow.tick();
   assert.ok(f.final(second).job); assert.equal(f.draft(second).job, undefined); assert.equal(f.draft(third).job, undefined);
   assert.ok(!f.calls.some(call => call.command === 'start_local_transcription' && call.args.sessionDir === second.session_dir && call.args.workflowRole === 'live-draft'));
 });
 
 test('user pause during capture persists without resuming Draft, and Final still runs after stop', async () => {
-  const f = fixture(); await f.workflow.captureStarted(capture); await f.workflow.stopWorker(f.draft());
+  const f = fixture(); await f.startLegacyCapture(capture); await f.workflow.stopWorker(f.draft());
   await finishDraft(f); await f.workflow.tick();
   assert.equal(f.draft().pausedByUser, true); assert.equal(f.draft().recording, true); assert.equal(f.final().job, undefined);
   assert.equal(f.count('resume_local_transcription'), 0); assert.equal(f.count('stop_recording'), 0);
@@ -192,7 +201,7 @@ test('user pause during capture persists without resuming Draft, and Final still
 });
 
 test('pausing a queued Final persists across reload until explicit Retry', async () => {
-  const f = fixture(); await f.workflow.captureStarted(capture); await f.workflow.stopWorker(f.final());
+  const f = fixture(); await f.startLegacyCapture(capture); await f.workflow.stopWorker(f.final());
   await f.workflow.captureStopped(capture); await finishDraft(f);
   assert.equal(f.final().job, undefined); assert.equal(f.final().pausedByUser, true);
   f.reload(); await f.workflow.refreshAfterReload(null); assert.equal(f.final().job, undefined);
@@ -216,7 +225,7 @@ test('failed Final requires explicit retry and preserves its identity', async ()
 
 test('a duplicate stop cannot clear a failed Final start and silently retry it', async () => {
   const f = fixture(); f.failStart('final');
-  await f.workflow.captureStarted(capture); await f.workflow.captureStopped(capture); await finishDraft(f);
+  await f.startLegacyCapture(capture); await f.workflow.captureStopped(capture); await finishDraft(f);
   assert.equal(f.final().job, undefined); assert.match(f.final().error, /unavailable/);
   const attempts = () => f.calls.filter(call => call.command === 'start_local_transcription' && call.args.workflowRole === 'final').length;
   await f.workflow.captureStopped(capture); await f.workflow.tick(); assert.equal(attempts(), 1);
@@ -224,7 +233,7 @@ test('a duplicate stop cannot clear a failed Final start and silently retry it',
 });
 
 test('reload during handoff hydrates saved text and does not repeat stop or start', async () => {
-  const f = fixture(); await f.workflow.captureStarted(capture); await f.workflow.captureStopped(capture);
+  const f = fixture(); await f.startLegacyCapture(capture); await f.workflow.captureStopped(capture);
   f.status(f.draft(), { state: 'stopped', segments: [segment()] }); f.reload(); await f.workflow.refreshAfterReload(null);
   assert.equal(f.count('stop_local_transcription'), 1); assert.equal(f.count('start_local_transcription'), 2);
   assert.equal(f.draft().job.segments.length, 1); assert.ok(f.final().job);
@@ -232,7 +241,7 @@ test('reload during handoff hydrates saved text and does not repeat stop or star
 });
 
 test('interrupted capture requires audio recovery before automatic Final', async () => {
-  const f = fixture(); await f.workflow.captureStarted(capture);
+  const f = fixture(); await f.startLegacyCapture(capture);
   f.status(f.draft(), { state: 'failed', error: 'parent restarted' }); f.reload(); await f.workflow.refreshAfterReload(null);
   assert.ok(f.runs().every(run => run.needsRecovery)); assert.equal(f.final().job, undefined);
   await f.workflow.captureStopped(capture);
@@ -240,7 +249,7 @@ test('interrupted capture requires audio recovery before automatic Final', async
 });
 
 test('missing browser pointers rediscover native role jobs without starting or resuming a duplicate', async () => {
-  const f = fixture(); await f.workflow.captureStarted(capture);
+  const f = fixture(); await f.startLegacyCapture(capture);
   const id = f.draft().job.job_id;
   f.status(f.draft(), { state: 'stopped', segments: [segment()] });
   f.workflow.state.runs = []; await f.workflow.refreshAfterReload(capture);
@@ -258,7 +267,7 @@ test('native legacy jobs stay roleless when browser pointers are missing', async
 });
 
 test('failed graceful stop remains visible, is not flooded, and can be retried once explicitly', async () => {
-  const f = fixture(); await f.workflow.captureStarted(capture); f.failStops(1); await f.workflow.captureStopped(capture);
+  const f = fixture(); await f.startLegacyCapture(capture); f.failStops(1); await f.workflow.captureStopped(capture);
   f.status(f.draft(), { segments: [segment()] }); await f.workflow.tick(); await f.workflow.tick();
   assert.equal(f.count('stop_local_transcription'), 1); assert.match(f.draft().error, /stop request failed/); assert.equal(f.final().job, undefined);
   await f.workflow.retry(f.draft()); assert.equal(f.count('stop_local_transcription'), 2);
@@ -266,7 +275,7 @@ test('failed graceful stop remains visible, is not flooded, and can be retried o
 });
 
 test('speakers run only for completed Final, never Draft, and failed speakers do not loop', async () => {
-  const f = fixture(); f.enableSpeakers(); await f.workflow.captureStarted(capture);
+  const f = fixture(); f.enableSpeakers(); await f.startLegacyCapture(capture);
   f.status(f.draft(), { state: 'complete', segments: [segment()] }); await f.workflow.captureStopped(capture);
   assert.equal(f.count('start_speaker_identification'), 0);
   f.status(f.final(), { state: 'complete', segments: [segment('final-segment')] }); await f.workflow.tick(); await f.workflow.tick();
@@ -279,7 +288,7 @@ test('speakers run only for completed Final, never Draft, and failed speakers do
 
 test('stopping while native start is in flight never mistakes the started Draft for skipped', async () => {
   const f = fixture(); let release; f.gateStarts(new Promise(resolve => { release = resolve; }));
-  const started = f.workflow.captureStarted(capture);
+  const started = f.startLegacyCapture(capture);
   for (let i = 0; i < 20 && !f.count('start_local_transcription'); i++) await Promise.resolve();
   assert.equal(f.count('start_local_transcription'), 1);
   await f.workflow.captureStopped(capture); assert.notEqual(f.draft().draftSkipped, true); assert.equal(f.final().job, undefined);
@@ -291,7 +300,7 @@ test('stopping while native start is in flight never mistakes the started Draft 
 test('legacy roleless captures remain single-model and never gain an automatic Final', async () => {
   const oldPreferences = { profile: 'apex-20', languageMode: 'english', timing: 'during-recording' };
   const legacy = { capture, meetingId: 'legacy-meeting', recording: true, primary: true, preferences: oldPreferences };
-  const f = fixture({ runs: [legacy] }); await f.workflow.captureStarted(capture); await f.workflow.captureStopped(capture);
+  const f = fixture({ runs: [legacy] }); await f.startLegacyCapture(capture); await f.workflow.captureStopped(capture);
   assert.equal(f.runs().length, 1); assert.equal(f.runs()[0].role, undefined); assert.equal(f.runs()[0].preferences.languageMode, 'english');
   assert.equal(f.count('start_local_transcription'), 1); assert.equal(f.count('stop_local_transcription'), 0);
   assert.equal(f.calls.find(call => call.command === 'start_local_transcription').args.workflowRole, undefined);
@@ -316,4 +325,161 @@ test('manual versions cannot hijack a paired capture when a duplicate stop arriv
   assert.equal(f.count('start_local_transcription'), 2); assert.equal(f.stops.length, 1);
   assert.equal(f.draft().captureEnded, true); assert.equal(f.final().captureEnded, true);
   assert.equal(f.workflow.state.runs.find(run => run.job?.job_id === manual.job_id).role, undefined);
+});
+
+test('new calls start a single primary Trelis live job and drain that same job after stop', async () => {
+  const f = fixture(); await Promise.all([f.workflow.captureStarted(capture), f.workflow.captureStarted(capture)]);
+  assert.equal(f.runs().length, 1); const live = f.live(), id = live.job.job_id;
+  assert.equal(live.primary, true); assert.equal(live.preferences.profile, 'trelis-20');
+  assert.equal(live.preferences.timing, 'during-recording'); assert.equal(f.count('start_local_transcription'), 1);
+  f.status(live, { segments: [segment()] }); await f.workflow.tick();
+  assert.equal(live.transcriptMeetingId, live.meetingId);
+  await Promise.all([f.workflow.captureStopped(capture), f.workflow.captureStopped(capture)]);
+  assert.equal(f.count('stop_local_transcription'), 0); assert.equal(f.count('start_local_transcription'), 1);
+  assert.equal(live.job.job_id, id); assert.equal(live.recording, false); assert.equal(f.stops.length, 1);
+  f.status(live, { state: 'complete', segments: [segment(), segment('tail')] }); await f.workflow.tick();
+  await f.workflow.captureStarted(capture); await f.workflow.captureStopped(capture);
+  assert.equal(live.recording, false); assert.equal(live.importedCount, 2); assert.equal(f.runs().length, 1);
+  assert.equal(f.count('start_local_transcription'), 1);
+});
+
+test('a missed start event still creates only Trelis and processes saved audio once', async () => {
+  const f = fixture(); await f.workflow.captureStopped(capture);
+  assert.equal(f.runs().length, 1); assert.equal(f.live().recording, false);
+  assert.equal(f.live().job.workflow_role, 'live-final'); assert.equal(f.count('stop_local_transcription'), 0);
+});
+
+test('fallback waits for actual Trelis exit and final checkpoint import, then creates a child version', async () => {
+  const f = fixture(); await f.workflow.captureStarted(capture); const live = f.live();
+  f.status(live, { segments: [segment()] }); await f.workflow.tick();
+  const primaryId = live.transcriptMeetingId;
+  await Promise.all([f.workflow.useApexFallback(live), f.workflow.useApexFallback(live)]);
+  assert.equal(f.runs().length, 2); assert.equal(f.count('stop_local_transcription'), 1);
+  assert.equal(f.fallback().job, undefined); assert.equal(live.pausedByUser, true);
+  f.status(live, { state: 'running', checkpoint_state: 'stopped', segments: [segment(), segment('tail')] }); await f.workflow.tick();
+  assert.equal(f.fallback().job, undefined);
+  f.failImport(live); f.status(live, { state: 'stopped' }); await f.workflow.tick();
+  assert.equal(f.fallback().job, undefined); f.failImport(live, false); await f.workflow.tick();
+  assert.equal(f.fallback().job.workflow_role, 'fallback'); assert.equal(f.fallback().primary, false);
+  f.status(f.fallback(), { segments: [segment('apex-own-id', 'Mira said seven notebooks.')] }); await f.workflow.tick();
+  assert.notEqual(f.fallback().transcriptMeetingId, primaryId);
+  assert.equal(live.transcriptMeetingId, primaryId); assert.equal(live.job.segments[0].text, segment().text);
+  assert.equal(f.bindings.get(primaryId), live.job.job_id);
+  const imported = f.calls.findLastIndex(call => call.command === 'import_local_transcription' && call.args.jobId === live.job.job_id);
+  const started = f.calls.findIndex(call => call.command === 'start_local_transcription' && call.args.workflowRole === 'fallback');
+  assert.ok(imported < started);
+});
+
+test('Trelis start failure leaves recording intact and permits explicit fallback without a Trelis job', async () => {
+  const f = fixture(); f.failStart('live-final'); await f.workflow.captureStarted(capture);
+  assert.equal(f.live().job, undefined); assert.equal(f.live().recording, true);
+  await f.workflow.tick(); assert.equal(f.count('start_local_transcription'), 1);
+  await f.workflow.useApexFallback(f.live()); assert.ok(f.fallback().job);
+  assert.equal(f.count('stop_local_transcription'), 0);
+  await f.workflow.captureStopped(capture); assert.equal(f.fallback().recording, false);
+  assert.equal(f.count('stop_local_transcription'), 0); assert.equal(f.count('start_local_transcription'), 2);
+});
+
+test('fallback during an in-flight Trelis start waits and pauses the eventual job', async () => {
+  const f = fixture(); let release; f.gateStarts(new Promise(resolve => { release = resolve; }));
+  const started = f.workflow.captureStarted(capture);
+  for (let i = 0; i < 30 && !f.count('start_local_transcription'); i++) await Promise.resolve();
+  await f.workflow.useApexFallback(f.live()); await f.workflow.captureStopped(capture);
+  assert.equal(f.fallback().job, undefined); release(); await started; f.gateStarts(undefined); await f.workflow.tick();
+  assert.equal(f.count('stop_local_transcription'), 1); assert.equal(f.fallback().job, undefined);
+  f.status(f.live(), { state: 'stopped' }); await f.workflow.tick();
+  assert.ok(f.fallback().job); assert.equal(f.fallback().captureEnded, true);
+});
+
+test('fallback stop failures are visible, bounded, and repaired by an explicit fallback action', async () => {
+  const f = fixture(); await f.workflow.captureStarted(capture); f.failStops(1);
+  await f.workflow.useApexFallback(f.live()); await f.workflow.tick(); await f.workflow.tick();
+  assert.equal(f.count('stop_local_transcription'), 1); assert.match(f.live().stopError, /stop request failed/);
+  assert.equal(f.fallback().job, undefined); await f.workflow.useApexFallback(f.live());
+  assert.equal(f.count('stop_local_transcription'), 2);
+  f.status(f.live(), { state: 'stopped' }); await f.workflow.tick(); assert.ok(f.fallback().job);
+});
+
+test('reload preserves fallback choice, rehydrates checkpoints, and never resumes Trelis automatically', async () => {
+  const f = fixture(); await f.workflow.captureStarted(capture); await f.workflow.useApexFallback(f.live());
+  f.status(f.live(), { state: 'stopped', segments: [segment()] }); f.reload(); await f.workflow.refreshAfterReload(capture);
+  assert.equal(f.count('stop_local_transcription'), 1); assert.equal(f.count('start_local_transcription'), 2);
+  assert.equal(f.live().pausedByUser, true); assert.equal(f.live().importedCount, 1); assert.ok(f.fallback().job);
+  await f.workflow.captureStopped(capture); f.status(f.fallback(), { state: 'complete' }); await f.workflow.tick();
+  f.reload(); await f.workflow.refreshAfterReload(null); await f.workflow.tick();
+  assert.equal(f.count('resume_local_transcription'), 0); assert.equal(f.count('start_local_transcription'), 2);
+});
+
+test('native fallback rediscovery preserves roles and identities when browser pointers are missing', async () => {
+  const f = fixture(); await f.workflow.captureStarted(capture); await f.workflow.useApexFallback(f.live());
+  f.status(f.live(), { state: 'stopped' }); await f.workflow.tick();
+  const id = f.fallback().job.job_id; f.workflow.state.runs = []; await f.workflow.refreshAfterReload(capture);
+  assert.equal(f.runs().length, 2); assert.equal(f.live().pausedByUser, true); assert.equal(f.live().fallbackRequested, true);
+  assert.equal(f.fallback().job.job_id, id); assert.equal(f.fallback().primary, false);
+  assert.equal(f.count('start_local_transcription'), 2); assert.equal(f.count('resume_local_transcription'), 0);
+});
+
+test('explicit Trelis retry waits for fallback checkpoint and resumes its original primary job', async () => {
+  const f = fixture(); await f.workflow.captureStarted(capture); const id = f.live().job.job_id;
+  await f.workflow.useApexFallback(f.live()); f.status(f.live(), { state: 'stopped' }); await f.workflow.tick();
+  await assert.rejects(f.workflow.retry(f.live()), /Pause Apex/);
+  assert.equal(f.live().pausedByUser, true); assert.equal(f.live().fallbackRequested, true);
+  await f.workflow.stopWorker(f.fallback()); await assert.rejects(f.workflow.retry(f.live()), /Pause Apex/);
+  f.status(f.fallback(), { state: 'stopped', segments: [segment('fallback-tail')] }); await f.workflow.tick();
+  await f.workflow.retry(f.live()); assert.equal(f.live().job.job_id, id);
+  assert.equal(f.count('resume_local_transcription'), 1); assert.equal(f.fallback().pausedByUser, true);
+  assert.equal(f.live().fallbackRequested, false);
+});
+
+test('paused queued Trelis stays paused through stop and reload until explicit retry', async () => {
+  const f = fixture(); await f.workflow.captureStarted(capture); await f.workflow.captureStarted(second);
+  assert.equal(f.live(second).job, undefined); await f.workflow.stopWorker(f.live(second));
+  await f.workflow.captureStopped(second); f.status(f.live(), { state: 'complete' }); await f.workflow.captureStopped(capture);
+  f.reload(); await f.workflow.refreshAfterReload(null);
+  assert.equal(f.live(second).job, undefined); await f.workflow.retry(f.live(second)); assert.ok(f.live(second).job);
+});
+
+test('capture stop while Trelis starts drains it without requesting stop or making a second pass', async () => {
+  const f = fixture(); let release; f.gateStarts(new Promise(resolve => { release = resolve; }));
+  const started = f.workflow.captureStarted(capture);
+  for (let i = 0; i < 30 && !f.count('start_local_transcription'); i++) await Promise.resolve();
+  await f.workflow.captureStopped(capture); release(); await started; f.gateStarts(undefined); await f.workflow.tick();
+  assert.equal(f.count('stop_local_transcription'), 0); assert.equal(f.count('start_local_transcription'), 1);
+  assert.equal(f.live().captureEnded, true); assert.equal(f.live().job.state, 'running');
+});
+
+test('interrupted Trelis capture requires recovery and never silently resumes a failed job', async () => {
+  const f = fixture(); await f.workflow.captureStarted(capture);
+  f.status(f.live(), { state: 'failed', segments: [segment()], error: 'synthetic interrupted process' });
+  f.reload(); await f.workflow.refreshAfterReload(null); assert.equal(f.live().needsRecovery, true);
+  await assert.rejects(f.workflow.useApexFallback(f.live()), /Recover/);
+  await f.workflow.captureStopped(capture); assert.equal(f.live().needsRecovery, false);
+  assert.equal(f.count('resume_local_transcription'), 0); await f.workflow.retry(f.live());
+  assert.equal(f.count('resume_local_transcription'), 1); assert.equal(f.count('start_local_transcription'), 1);
+});
+
+test('speaker processing waits for recording to end and the completed primary to be imported', async () => {
+  const f = fixture(); f.enableSpeakers(); await f.workflow.captureStarted(capture);
+  f.status(f.live(), { state: 'complete', segments: [segment()] }); await f.workflow.tick();
+  assert.equal(f.count('start_speaker_identification'), 0); await f.workflow.captureStopped(capture);
+  assert.equal(f.count('start_speaker_identification'), 1);
+});
+
+test('adopting a durable fallback cannot bind it as the primary transcript', async () => {
+  const f = fixture(); const job = { job_id: 'fallback-existing', session_dir: capture.session_dir,
+    workflow_role: 'fallback', profile: 'apex-20', state: 'complete', segments: [segment()] };
+  f.jobs.set(job.job_id, job); await f.workflow.adopt(job, 'base-meeting', true);
+  const run = f.workflow.state.runs[0]; assert.equal(run.primary, false);
+  assert.equal(run.transcriptMeetingId, 'meeting-local-fallback-existing');
+});
+
+test('rediscovery does not pause Trelis that was explicitly resumed after fallback', async () => {
+  const f = fixture(); await f.workflow.captureStarted(capture); await f.workflow.useApexFallback(f.live());
+  f.status(f.live(), { state: 'stopped' }); await f.workflow.tick();
+  f.status(f.fallback(), { state: 'complete' }); await f.workflow.tick(); await f.workflow.retry(f.live());
+  const stopCount = f.count('stop_local_transcription'); f.workflow.state.runs = [];
+  await f.workflow.refreshAfterReload(capture);
+  assert.equal(f.live().job.state, 'running'); assert.notEqual(f.live().fallbackRequested, true);
+  assert.notEqual(f.live().pausedByUser, true); assert.equal(f.count('stop_local_transcription'), stopCount);
+  assert.equal(f.count('start_local_transcription'), 2); assert.equal(f.count('resume_local_transcription'), 1);
 });

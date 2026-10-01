@@ -189,3 +189,109 @@ def verify_conversion_provenance(model_spec: dict, sidecar_path: str | Path | No
     except (OSError, ValueError, TypeError, AttributeError) as exc:
         result["issues"].append(str(exc))
     return result
+
+
+def verify_openvino_assets(model_spec: dict, export_path: str | Path,
+                           source_verification: dict) -> dict:
+    """Verify an existing IR export separately from its original HF assets.
+
+    The conversion receipt binds two independently checked manifests. It records
+    conversion provenance, not proof of the publisher's identity. No export,
+    quantization, or dependency import happens here.
+    """
+    result = {"ok": False, "issues": [], "verified_hashes": {}}
+    try:
+        source = local_path(model_spec.get("artifact_path"))
+        target = local_path(export_path)
+        if not target.is_dir() or target == source:
+            raise ValueError("OpenVINO export_path must be a separate existing local directory.")
+        if not source_verification.get("ok") or source_verification.get("integrity") != "manifest_files_verified":
+            raise ValueError("OpenVINO requires independently verified source artifact-manifest.json assets.")
+        loaded_source_files = {"config.json", "generation_config.json", "preprocessor_config.json",
+                               "tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt",
+                               "normalizer.json", "special_tokens_map.json", "added_tokens.json",
+                               "processor_config.json"}
+        for name in loaded_source_files:
+            if (source / name).is_file() and name not in source_verification["verified_hashes"]:
+                raise ValueError(f"Source manifest omits loaded processor/config asset: {name}")
+        sidecar = target / "conversion-provenance.json"
+        metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+        if metadata.get("schema_version") != 1:
+            raise ValueError("Unsupported OpenVINO conversion provenance schema.")
+        for field, expected in (("model_id", model_spec.get("model_id")),
+                                ("source_repo_id", model_spec.get("repo_id")),
+                                ("source_revision", model_spec.get("source_revision"))):
+            if not expected or metadata.get(field) != expected:
+                raise ValueError(f"OpenVINO conversion {field} does not match the model specification.")
+        if metadata.get("source_manifest_sha256") != source_verification.get("manifest_sha256"):
+            raise ValueError("OpenVINO conversion source manifest SHA-256 mismatch.")
+        manifest_path = target / "export-complete.json"
+        manifest_hash = sha256_file(manifest_path)
+        if metadata.get("export_manifest_sha256") != manifest_hash:
+            raise ValueError("OpenVINO export manifest SHA-256 mismatch.")
+        converter = metadata.get("converter", {})
+        required_options = {
+            "name": "optimum.exporters.openvino.main_export", "version": "2.2.0",
+            "task": "automatic-speech-recognition-with-past", "dtype": "fp16",
+            "stateful": True, "convert_tokenizer": False, "load_in_8bit": False,
+        }
+        for name, expected in required_options.items():
+            if converter.get(name) != expected or type(converter.get(name)) is not type(expected):
+                raise ValueError(f"Unsupported OpenVINO conversion option: {name}.")
+        packages = converter.get("packages", {})
+        for name in ("openvino", "optimum-intel", "transformers", "torch", "numpy"):
+            if not isinstance(packages.get(name), str) or not packages[name].strip():
+                raise ValueError(f"OpenVINO conversion is missing pinned package version: {name}.")
+        if packages["optimum-intel"] != converter["version"]:
+            raise ValueError("OpenVINO converter version disagrees with its package pin.")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        files = manifest.get("files")
+        if not isinstance(files, dict) or not files:
+            raise ValueError("OpenVINO export manifest must have a nonempty files mapping.")
+        required = {"config.json", "generation_config.json", "preprocessor_config.json",
+                    "openvino_encoder_model.xml", "openvino_encoder_model.bin",
+                    "openvino_decoder_model.xml", "openvino_decoder_model.bin"}
+        if not required.issubset(files):
+            raise ValueError("OpenVINO export manifest omits required graph or configuration files.")
+        if manifest.get("load_in_8bit") is not False:
+            raise ValueError("OpenVINO export must explicitly declare load_in_8bit=false.")
+        # Optimum may load additional decoder graphs or configuration from this
+        # directory. Every candidate graph/config must be covered by the receipt.
+        for file in target.iterdir():
+            if file.is_file() and file.name not in ("conversion-provenance.json", "export-complete.json"):
+                if file.suffix in (".xml", ".bin", ".json") and file.name not in files:
+                    raise ValueError(f"OpenVINO export manifest omits loadable file: {file.name}")
+        for name, entry in files.items():
+            file = _child(target, name)
+            digest, size = entry.get("sha256"), entry.get("size")
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+                raise ValueError(f"Invalid OpenVINO asset SHA-256: {name}")
+            if type(size) is not int or size <= 0 or not file.is_file() or file.stat().st_size != size:
+                raise ValueError(f"Missing, empty, or size-mismatched OpenVINO asset: {name}")
+            actual = _asset_hash(file)
+            if actual != digest.lower():
+                raise ValueError(f"OpenVINO asset SHA-256 mismatch: {name}")
+            result["verified_hashes"][name] = actual
+        source_config = json.loads((source / "config.json").read_text(encoding="utf-8"))
+        export_config = json.loads((target / "config.json").read_text(encoding="utf-8"))
+        for key in ("model_type", "vocab_size", "decoder_start_token_id", "max_target_positions"):
+            if key not in source_config or export_config.get(key) != source_config[key]:
+                raise ValueError(f"OpenVINO export changes source model configuration: {key}")
+        if export_config["model_type"] != "whisper" or manifest.get("vocab_size") != source_config["vocab_size"]:
+            raise ValueError("OpenVINO export is not the matching Whisper vocabulary.")
+        # Generation settings include suppression IDs and must survive export.
+        source_generation = json.loads((source / "generation_config.json").read_text(encoding="utf-8"))
+        export_generation = json.loads((target / "generation_config.json").read_text(encoding="utf-8"))
+        # save_pretrained records the exporting library version; this is not a
+        # decoding setting. All actual generation settings must remain equal.
+        source_generation.pop("transformers_version", None)
+        export_generation.pop("transformers_version", None)
+        if source_generation != export_generation:
+            raise ValueError("OpenVINO export changes the source generation configuration.")
+        result.update(ok=True, integrity="source_and_export_manifests_verified", metadata=metadata,
+                      export_path=str(target), sidecar_path=str(sidecar), sidecar_sha256=sha256_file(sidecar),
+                      export_manifest_sha256=manifest_hash, source_hashes_independently_verified=True,
+                      hash_cache_policy="same-process path/size/mtime_ns; restart to force rehash")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        result["issues"].append(str(exc))
+    return result

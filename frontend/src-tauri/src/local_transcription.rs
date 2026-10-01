@@ -45,13 +45,17 @@ pub fn get_local_stt_profiles() -> Result<Vec<Value>, String> {
     let config = config_path().and_then(|p| read(&p)).ok();
     Ok(["trelis-20","apex-20"].iter().map(|id| {
         let (model,seconds) = profile_parts(id).unwrap();
+        let accelerated = config.as_ref().map(|c| c["models"][model]["backend"] == "openvino"
+            && c["models"][model]["device"] == "GPU"
+            && c["models"][model]["export_path"].as_str().map(|p|Path::new(p).join("conversion-provenance.json").is_file()).unwrap_or(false)).unwrap_or(false);
         let available = config.as_ref().map(|c| ["python_executable","worker_script","registry_path"].iter()
             .all(|key| c[key].as_str().map(|p| Path::new(p).is_file()).unwrap_or(false))
             && c["models"][model]["artifact_path"].as_str().map(|p| Path::new(p).exists()).unwrap_or(false)).unwrap_or(false);
         json!({"id":id,"model":model,"chunk_seconds":seconds,"available":available,
-            "reason":if !available {"Local runtime needs setup (STTApp/runtime.json)"} else if model=="apex" {"Kept up in a five-minute paced worker replay; live capture validation remains"} else {"Current CPU runtime is slower than a call; use after recording"},
+            "reason":if !available {"Local runtime needs setup (STTApp/runtime.json)"} else if model=="apex" {"Available as a separate fallback transcript"} else if accelerated {"Local GPU runtime configured; 20-second audio windows plus processing time"} else {"GPU setup is needed for Trelis live transcription; Apex fallback is available"},
             "language_modes":["hinglish","english"],"live_qualified":false,
-            "live_replay_supported":model=="apex","recommended_timing":if model=="apex" {"during-recording"} else {"after-recording"}})
+            "backend":config.as_ref().map(|c|c["models"][model]["backend"].clone()),
+            "live_replay_supported":model=="apex" || accelerated,"recommended_timing":if model=="apex" || accelerated {"during-recording"} else {"after-recording"}})
     }).collect())
 }
 
@@ -88,7 +92,67 @@ pub async fn ensure_capture_meeting(state: tauri::State<'_,AppState>, session_di
 }
 
 fn launch(id: &str) -> Result<(), String> {
-    launch_process(id,&config_path()?,&job_dir(id)?)
+    let dir = job_dir(id)?;
+    let snapshot = ensure_job_runtime_snapshot(&dir, &config_path()?)?;
+    launch_process(id, &snapshot, &dir)
+}
+
+fn validate_asr_runtime(config: &Value) -> Result<(), String> {
+    for key in ["python_executable", "worker_script", "registry_path"] {
+        let value = config[key].as_str().filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("ASR runtime is missing {key}"))?;
+        let path = Path::new(value);
+        if !path.is_absolute() || !path.is_file() {
+            return Err(format!("ASR runtime {key} must refer to an existing absolute file"));
+        }
+    }
+    if !config["models"].as_object().map(|models| !models.is_empty()).unwrap_or(false) {
+        return Err("ASR runtime has no model configuration".into());
+    }
+    Ok(())
+}
+
+fn ensure_job_runtime_snapshot(dir: &Path, current_config: &Path) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let snapshot = dir.join("runtime-snapshot.json");
+    match fs::metadata(&snapshot) {
+        Ok(_) => {
+            // An existing job always keeps its original Python, worker,
+            // registry and decoding config, even after the global default changes.
+            validate_asr_runtime(&read(&snapshot)?)?;
+            return Ok(snapshot);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    match fs::metadata(dir.join("status.json")) {
+        Ok(_) => return Err("This existing transcription job has no runtime snapshot. Restore its original runtime snapshot before retrying; the recording and transcript are preserved.".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    // The installer migrates older jobs before replacing runtime.json. A
+    // checkpoint without a migrated snapshot must never adopt today's engine.
+    let bytes = fs::read(current_config).map_err(|e| e.to_string())?;
+    let config: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    validate_asr_runtime(&config)?;
+    let temporary = dir.join(format!(".runtime-snapshot-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<(), String> {
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|e| e.to_string())?;
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        drop(file);
+        // Linking a complete sibling publishes atomically without replacing an
+        // existing snapshot. Concurrent creators use the winner's exact bytes.
+        match fs::hard_link(&temporary, &snapshot) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(format!("Could not publish the job runtime snapshot: {error}")),
+        }
+    })();
+    let _ = fs::remove_file(&temporary);
+    result?;
+    validate_asr_runtime(&read(&snapshot)?)?;
+    Ok(snapshot)
 }
 
 fn launch_process(id: &str, config_file: &Path, dir: &Path) -> Result<(),String> {
@@ -204,6 +268,12 @@ pub fn start_local_transcription(session_dir: String, profile: String, language_
         if role == "final" && !capture_ready_for_final(&session)? {
             return Err("Finalize or recover the saved recording before starting its final transcript".into());
         }
+        if role == "live-final" {
+            let config = read(&config_path()?)?;
+            if config["models"]["trelis"]["backend"] != "openvino" || config["models"]["trelis"]["device"] != "GPU" {
+                return Err("Trelis live transcription needs the local GPU runtime. Recording is preserved; use Apex fallback or finish GPU setup.".into());
+            }
+        }
     }
     let job_id = uuid::Uuid::new_v4().to_string();
     let dir = job_dir(&job_id)?;
@@ -241,7 +311,9 @@ fn validate_workflow_role(role: Option<&str>, profile: &str) -> Result<(), Strin
         None => Ok(()),
         Some("live-draft") if profile == "apex-20" => Ok(()),
         Some("final") if profile == "trelis-20" => Ok(()),
-        _ => Err("The automatic workflow uses Apex 20s for the live draft and Trelis 20s for the final transcript".into()),
+        Some("live-final") if profile == "trelis-20" => Ok(()),
+        Some("fallback") if profile == "apex-20" => Ok(()),
+        _ => Err("Use Trelis 20s for the live transcript or Apex 20s for its fallback".into()),
     }
 }
 
@@ -341,7 +413,7 @@ async fn has_transcript_bindings(state: &tauri::State<'_, AppState>) -> Result<b
     Ok(count > 0)
 }
 
-/// Durable navigation metadata. Only automatic draft children are grouped out
+/// Durable navigation metadata. Automatic draft and fallback children are grouped out
 /// of the sidebar; existing independent/experimental transcripts remain visible.
 #[tauri::command]
 pub async fn get_local_transcript_groups(state: tauri::State<'_, AppState>) -> Result<Vec<Value>, String> {
@@ -352,8 +424,8 @@ pub async fn get_local_transcript_groups(state: tauri::State<'_, AppState>) -> R
     for (job, meeting, source) in bindings {
         if meeting == source { continue; }
         let request = job_dir(&job).and_then(|dir| read(&dir.join("request.json"))).unwrap_or(Value::Null);
-        if request["workflow_role"] == "live-draft" {
-            groups.push(json!({"meeting_id":meeting,"source_meeting_id":source,"workflow_role":"live-draft"}));
+        if request["workflow_role"] == "live-draft" || request["workflow_role"] == "fallback" {
+            groups.push(json!({"meeting_id":meeting,"source_meeting_id":source,"workflow_role":request["workflow_role"]}));
         }
     }
     Ok(groups)
@@ -415,7 +487,7 @@ pub async fn import_local_transcription(state: tauri::State<'_,AppState>, job_id
     } else { format!("meeting-local-{job_id}") };
     let now = chrono::Utc::now();
     sqlx::query("INSERT OR IGNORE INTO meetings(id,title,created_at,updated_at,folder_path) VALUES(?,?,?,?,?)")
-        .bind(&child_id).bind(format!("{title} — {}", if status["workflow_role"] == "live-draft" { "Apex live draft" } else { profile })).bind(now).bind(now).bind(status["session_dir"].as_str())
+        .bind(&child_id).bind(format!("{title} — {}", match status["workflow_role"].as_str() { Some("live-draft") => "Apex live draft", Some("fallback") => "Apex fallback", _ => profile })).bind(now).bind(now).bind(status["session_dir"].as_str())
         .execute(&mut *tx).await.map_err(|e| e.to_string())?;
     sqlx::query("INSERT OR IGNORE INTO local_transcription_bindings(job_id,meeting_id,source_meeting_id) VALUES(?,?,?)")
         .bind(&job_id).bind(&child_id).bind(&source_meeting_id).execute(&mut *tx).await.map_err(|e|e.to_string())?;
@@ -473,9 +545,98 @@ pub fn open_claude_desktop(mode: String, transcript: String, title: String) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn synthetic_asr_runtime(root: &Path, label: &str) -> Value {
+        let mut config = json!({"models":{"trelis":{"backend":label}}});
+        for key in ["python_executable", "worker_script", "registry_path"] {
+            let path = root.join(format!("{label}-{key}"));
+            fs::write(&path, b"synthetic fixture; never executed").unwrap();
+            config[key] = json!(path);
+        }
+        config
+    }
+    #[test] fn asr_runtime_snapshot_keeps_old_runtime_after_global_change() {
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("job"); fs::create_dir(&job).unwrap();
+        let current = root.path().join("runtime.json");
+        let old = synthetic_asr_runtime(root.path(), "old-engine");
+        let bytes = serde_json::to_vec_pretty(&old).unwrap();
+        fs::write(&current, &bytes).unwrap();
+        let snapshot = ensure_job_runtime_snapshot(&job, &current).unwrap();
+        assert_eq!(fs::read(&snapshot).unwrap(), bytes);
+        fs::write(job.join("status.json"), b"{}").unwrap();
+        let replacement = synthetic_asr_runtime(root.path(), "new-engine");
+        fs::write(&current, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        assert_eq!(ensure_job_runtime_snapshot(&job, &current).unwrap(), snapshot);
+        assert_eq!(read(&snapshot).unwrap(), old);
+        fs::remove_file(&current).unwrap();
+        assert_eq!(ensure_job_runtime_snapshot(&job, &current).unwrap(), snapshot);
+        assert_eq!(fs::read(&snapshot).unwrap(), bytes);
+    }
+    #[test] fn asr_runtime_snapshot_rejects_invalid_or_missing_files_without_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("job"); fs::create_dir(&job).unwrap();
+        let current = root.path().join("runtime.json");
+        let snapshot = job.join("runtime-snapshot.json");
+        assert!(ensure_job_runtime_snapshot(&job, &current).is_err());
+        fs::write(&current, b"{broken").unwrap();
+        assert!(ensure_job_runtime_snapshot(&job, &current).is_err());
+        assert!(!snapshot.exists());
+        let config = synthetic_asr_runtime(root.path(), "engine");
+        fs::write(&current, serde_json::to_vec(&config).unwrap()).unwrap();
+        fs::write(&snapshot, b"{broken").unwrap();
+        assert!(ensure_job_runtime_snapshot(&job, &current).is_err());
+        assert_eq!(fs::read(&snapshot).unwrap(), b"{broken");
+        fs::write(&snapshot, serde_json::to_vec(&config).unwrap()).unwrap();
+        for key in ["python_executable", "worker_script", "registry_path"] {
+            let path = Path::new(config[key].as_str().unwrap());
+            fs::remove_file(path).unwrap();
+            assert!(ensure_job_runtime_snapshot(&job, &current).is_err());
+            assert_eq!(read(&snapshot).unwrap(), config);
+            fs::write(path, b"synthetic fixture").unwrap();
+        }
+        let mut relative = config.clone(); relative["worker_script"] = json!("worker.py");
+        assert!(validate_asr_runtime(&relative).is_err());
+    }
+    #[test] fn legacy_asr_checkpoint_requires_original_runtime_migration() {
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("job"); fs::create_dir(&job).unwrap();
+        let current = root.path().join("runtime.json");
+        fs::write(&current, serde_json::to_vec(&synthetic_asr_runtime(root.path(), "new")).unwrap()).unwrap();
+        let status = b"{\"state\":\"stopped\",\"segments\":[{\"text\":\"preserved\"}]}";
+        fs::write(job.join("status.json"), status).unwrap();
+        assert!(ensure_job_runtime_snapshot(&job, &current).unwrap_err().contains("original runtime"));
+        assert!(!job.join("runtime-snapshot.json").exists());
+        let old = synthetic_asr_runtime(root.path(), "original");
+        fs::write(job.join("runtime-snapshot.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+        let chosen = ensure_job_runtime_snapshot(&job, &current).unwrap();
+        assert_eq!(read(&chosen).unwrap(), old);
+        assert_eq!(fs::read(job.join("status.json")).unwrap(), status);
+    }
+    #[test] fn concurrent_asr_snapshot_creation_has_one_complete_winner() {
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("job"); fs::create_dir(&job).unwrap();
+        let first = root.path().join("first.json");
+        let second = root.path().join("second.json");
+        let first_bytes = serde_json::to_vec(&synthetic_asr_runtime(root.path(), "first")).unwrap();
+        let second_bytes = serde_json::to_vec(&synthetic_asr_runtime(root.path(), "second")).unwrap();
+        fs::write(&first, &first_bytes).unwrap(); fs::write(&second, &second_bytes).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [first, second].into_iter().map(|config| {
+            let dir = job.clone(); let barrier = barrier.clone();
+            std::thread::spawn(move || { barrier.wait(); ensure_job_runtime_snapshot(&dir, &config) })
+        }).collect();
+        for handle in handles { assert!(handle.join().unwrap().is_ok()); }
+        let actual = fs::read(job.join("runtime-snapshot.json")).unwrap();
+        assert!(actual == first_bytes || actual == second_bytes);
+        assert_eq!(fs::read_dir(&job).unwrap().count(), 1);
+    }
     #[test] fn automatic_roles_do_not_admit_swapped_models() {
         assert!(validate_workflow_role(Some("live-draft"), "apex-20").is_ok());
         assert!(validate_workflow_role(Some("final"), "trelis-20").is_ok());
+        assert!(validate_workflow_role(Some("live-final"), "trelis-20").is_ok());
+        assert!(validate_workflow_role(Some("fallback"), "apex-20").is_ok());
+        assert!(validate_workflow_role(Some("live-final"), "apex-20").is_err());
+        assert!(validate_workflow_role(Some("fallback"), "trelis-20").is_err());
         assert!(validate_workflow_role(Some("final"), "apex-20").is_err());
         assert!(validate_workflow_role(Some("live-draft"), "trelis-20").is_err());
         assert!(validate_workflow_role(None, "apex-20").is_ok());

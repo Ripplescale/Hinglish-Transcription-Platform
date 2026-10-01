@@ -10,11 +10,11 @@ import { Button } from '@/components/ui/button';
 import { ArrowUpRight, ChevronDown, Download, FileText, Headphones, Pencil, Info } from 'lucide-react';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { useLocalWorkflow } from '@/contexts/LocalWorkflowContext';
-import { isTerminalJob } from '@/lib/local-transcription-workflow';
+import { isTerminalJob, type WorkflowRole } from '@/lib/local-transcription-workflow';
 import { useRouter } from 'next/navigation';
 
 type Review = ReturnType<typeof useTranscriptWorkspace>;
-interface TranscriptLayer { meeting_id: string; title: string; profile?: string | null; workflow_role?: 'live-draft' | 'final' | null; job_id?: string | null; state: string; primary: boolean }
+interface TranscriptLayer { meeting_id: string; title: string; profile?: string | null; workflow_role?: WorkflowRole | null; job_id?: string | null; state: string; primary: boolean }
 
 export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMore, totalCount, onLoadMore, onDraftChange }: {
   meeting: { id: string; title: string; created_at?: string; transcripts: Transcript[] };
@@ -42,6 +42,8 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
   const needsAttention = !!(run?.error || run?.job?.error) || ['failed', 'stopped'].includes(activeLayer?.state ?? '');
   const pendingFinal = activeRole === 'final' && !meeting.transcripts.length && (run?.job?.state ?? activeLayer?.state) !== 'complete' && !needsAttention;
   const processing = run?.job && !isTerminalJob(run.job.state);
+  const liveState = run?.job?.state ?? activeLayer?.state;
+  const liveTitle = liveState === 'complete' ? 'Final transcript' : !run?.recording && !isTerminalJob(liveState ?? 'queued') && !!run?.captureEnded ? 'Finishing transcript' : 'Live transcript';
   const audio = useRef<HTMLAudioElement>(null);
   const profileId = review.workspace.profile || activeLayer?.profile;
   const transcriptProfile = profileId === 'apex-20' ? 'Apex · 20s' : profileId === 'trelis-20' ? 'Trelis · 20s' : null;
@@ -62,6 +64,11 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
     if (window.dispatchEvent(new CustomEvent('xx-before-navigate', { cancelable: true, detail: { href } }))) router.push(href);
   };
   const layerName = (layer: TranscriptLayer) => {
+    if (layer.workflow_role === 'fallback') return 'Apex fallback';
+    if (layer.workflow_role === 'live-final') {
+      const layerRun = state.runs.find(item => item.job?.job_id === layer.job_id);
+      return layer.state === 'complete' ? 'Final transcript' : layerRun?.captureEnded && !isTerminalJob(layer.state) ? 'Finishing transcript' : 'Live transcript';
+    }
     if (layer.workflow_role === 'live-draft') return 'Live draft';
     if (layer.workflow_role === 'final' || (layer.primary && layers.some(item => item.workflow_role === 'live-draft'))) return 'Final transcript';
     return layer.profile === 'apex-20' ? 'Apex version' : layer.profile === 'trelis-20' ? 'Trelis version' : 'Original transcript';
@@ -126,7 +133,7 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
 
   return <section className="flex h-full min-h-0 min-w-0 flex-col bg-[var(--xx-paper)] text-[var(--xx-ink)]" aria-label="Transcript review">
     <header className="shrink-0 border-b border-[var(--xx-border)] px-5 pt-5 pb-4 space-y-3">
-      <div className="xx-eyebrow flex items-center gap-2"><FileText size={13} aria-hidden="true" />{activeRole === 'live-draft' ? 'Live draft' : activeRole === 'final' ? 'Final transcript' : 'Transcript'}</div>
+      <div className="xx-eyebrow flex items-center gap-2"><FileText size={13} aria-hidden="true" />{activeRole === 'fallback' ? 'Apex fallback' : activeRole === 'live-final' ? liveTitle : activeRole === 'live-draft' ? 'Live draft' : activeRole === 'final' ? 'Final transcript' : 'Transcript'}</div>
       <h1 className="text-[24px] leading-tight font-normal [font-family:Georgia,serif] break-words">{displayTitle}</h1>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-[11px] text-[var(--xx-muted)]">{transcriptProfile ? <span className="font-medium text-[var(--xx-accent)]">Transcript: {transcriptProfile}</span> : 'Original script'}<span className="mx-2">·</span>{totalCount ?? meeting.transcripts.length} segments</p>
@@ -146,13 +153,15 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
         {layers.map(layer => <button type="button" key={layer.meeting_id} aria-current={layer.meeting_id === meeting.id ? 'page' : undefined} className={`shrink-0 rounded-md px-3 py-1.5 text-xs transition-colors ${layer.meeting_id === meeting.id ? 'bg-[var(--xx-canvas)] font-medium text-[var(--xx-accent)]' : 'text-[var(--xx-muted)] hover:bg-[var(--xx-canvas)]'}`} onClick={() => openLayer(layer.meeting_id)}>{layerName(layer)}{['queued', 'not_started'].includes(layer.state) ? ' · pending' : !isTerminalJob(layer.state) ? ' · processing' : layer.state === 'failed' || layer.state === 'stopped' ? ' · needs attention' : ''}</button>)}
       </nav>}
       {activeRole === 'live-draft' && <p className="text-[11px] leading-4 text-[var(--xx-muted)]">Apex live draft, kept separately from the Trelis final transcript and its corrections.</p>}
+      {activeRole === 'fallback' && <p className="text-[11px] leading-4 text-[var(--xx-muted)]">Apex fallback. This version keeps its own notes and corrections; the Trelis transcript is still available.</p>}
+      {activeRole === 'live-final' && <p className="text-[11px] leading-4 text-[var(--xx-muted)]">Trelis keeps the original Hindi + English script. Raw recognition and your corrections are saved separately.</p>}
       {layerError && <p className="text-xs text-amber-800" title={layerError}>Other transcript versions could not be loaded. Your current transcript is still available.</p>}
-      {processing && <p role="status" className="text-[11px] text-[var(--xx-accent)]">Transcribing · {Math.round(run.job?.processed_audio_seconds ?? 0)}s processed · {Math.round(run.job?.backlog_seconds ?? 0)}s waiting{run.recording ? ' · recording continues' : ''}</p>}
-      {run && !run.job && !run.error && <p role="status" className="text-[11px] text-[var(--xx-accent)]">{run.recording ? 'Listening. Transcription starts when you stop.' : 'Audio saved. Waiting for the local worker.'}</p>}
+      {processing && <p role="status" className="text-[11px] text-[var(--xx-accent)]">{activeRole === 'live-final' && !run.recording ? 'Finishing transcript' : 'Transcribing'} · {Math.round(run.job?.processed_audio_seconds ?? 0)}s processed · {Math.round(run.job?.backlog_seconds ?? 0)}s waiting{run.recording ? ' · recording continues' : ''}</p>}
+      {run && !run.job && !run.error && <p role="status" className="text-[11px] text-[var(--xx-accent)]">{run.pausedByUser ? 'Transcription paused. Your saved audio is retained.' : run.recording && run.preferences.timing === 'after-recording' ? 'Listening. Transcription starts when you stop.' : 'Audio saved. Waiting for the local worker.'}</p>}
       {(run?.error || run?.job?.error) && <p role="alert" className="text-xs text-amber-800">Audio is saved. Transcription needs attention — open Tools → Transcription &amp; versions.</p>}
     </header>
     <div className="min-h-0 flex-1 overflow-y-auto px-5 py-2 [scrollbar-gutter:stable]">
-      {!meeting.transcripts.length && <div className="py-12 text-center"><Headphones className="mx-auto mb-3 text-[var(--xx-accent)]" size={26} /><p className="text-sm text-[var(--xx-muted)]">{pendingFinal ? 'The final transcript is on its way.' : 'Your words will appear here.'}</p><p className="mt-2 text-xs leading-5 text-[var(--xx-muted)]">{pendingFinal ? 'Trelis processes the saved audio after the call. You can read the Apex live draft while you wait.' : 'Saved audio is transcribed automatically after recording.'}</p></div>}
+      {!meeting.transcripts.length && <div className="py-12 text-center"><Headphones className="mx-auto mb-3 text-[var(--xx-accent)]" size={26} /><p className="text-sm text-[var(--xx-muted)]">{pendingFinal ? 'The final transcript is on its way.' : 'Your words will appear here.'}</p><p className="mt-2 text-xs leading-5 text-[var(--xx-muted)]">{pendingFinal ? 'Trelis processes the saved audio after the call. You can read the Apex live draft while you wait.' : activeRole === 'fallback' ? 'Apex replays the saved recording into this separate version.' : 'Audio is transcribed in 20-second windows plus processing time. Your original recording is retained.'}</p></div>}
       {meeting.transcripts.map(segment => {
         const text = effectiveText(segment, review.workspace.corrections);
         const corrected = text !== segment.text;

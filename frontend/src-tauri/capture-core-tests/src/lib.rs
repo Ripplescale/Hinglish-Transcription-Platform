@@ -37,6 +37,13 @@ mod automatic_workflow {
 }
 
 #[cfg(test)]
+mod runtime_snapshots {
+    use serde_json::{json, Value};
+    use std::{fs, path::{Path, PathBuf}};
+    include!(concat!(env!("OUT_DIR"), "/runtime_snapshots.rs"));
+}
+
+#[cfg(test)]
 mod syntax_checks {
     /// Syntax coverage only: this deliberately does not claim a Tauri typecheck.
     #[test]

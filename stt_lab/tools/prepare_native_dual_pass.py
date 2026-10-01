@@ -22,16 +22,36 @@ p.add_argument('--request', required=True)
 a = p.parse_args()
 request_path = Path(a.request)
 request = json.loads(request_path.read_text(encoding='utf-8'))
-root = Path(a.config).parent
+config = json.loads(Path(a.config).read_text(encoding='utf-8'))
+root = Path(config['synthetic_data_root'])
 with (root / 'synthetic-worker-starts.jsonl').open('a', encoding='utf-8') as out:
-    out.write(json.dumps({'job_id': request['job_id'], 'role': request.get('workflow_role'), 'pid': os.getpid()}) + '\n')
+    out.write(json.dumps({'job_id': request['job_id'], 'role': request.get('workflow_role'), 'pid': os.getpid(), 'runtime_marker': config.get('synthetic_runtime_marker'), 'config_path': a.config, 'worker_script': config['worker_script'], 'registry_path': config['registry_path']}) + '\n')
 role = request.get('workflow_role') or 'comparison'
-texts = ['Synthetic Apex raw draft: Mira counted 16 pencils.', 'Synthetic Apex raw draft: Willow requested 24 notebooks.'] if role == 'live-draft' else ['Synthetic Trelis raw final: मीरा ने 17 पेंसिल गिनीं।', 'Synthetic Trelis raw final: Willow ने 25 notebooks माँगीं।']
+texts = ['Synthetic Apex raw draft: Mira counted 16 pencils.', 'Synthetic Apex raw draft: Willow requested 24 notebooks.'] if role in ('live-draft', 'fallback') else ['Synthetic Trelis raw final: मीरा ने 17 पेंसिल गिनीं।', 'Synthetic Trelis raw final: Willow ने 25 notebooks माँगीं।']
 segments = [{'id': request['job_id'] + '-' + str(i), 'text': text, 'start_seconds': i * 10, 'end_seconds': (i + 1) * 10, 'source_track': 'system', 'final': True} for i, text in enumerate(texts)]
-status = {'job_id': request['job_id'], 'profile': request['profile'], 'session_dir': request['session_dir'], 'state': 'complete', 'segments': segments, 'processed_audio_seconds': 20, 'available_audio_seconds': 20, 'backlog_seconds': 0, 'synthetic_checkpoint': True}
+status = {'job_id': request['job_id'], 'profile': request['profile'], 'session_dir': request['session_dir'], 'state': 'complete', 'segments': segments, 'processed_audio_seconds': 20, 'available_audio_seconds': 20, 'backlog_seconds': 0, 'synthetic_checkpoint': True, 'runtime_marker': config.get('synthetic_runtime_marker')}
 temporary = request_path.parent / 'status.tmp'
-temporary.write_text(json.dumps(status, ensure_ascii=False), encoding='utf-8')
-temporary.replace(request_path.parent / 'status.json')
+def checkpoint():
+    temporary.write_text(json.dumps(status, ensure_ascii=False), encoding='utf-8')
+    temporary.replace(request_path.parent / 'status.json')
+if role == 'live-final' and config.get('synthetic_live_holds'):
+    status.update(state='waiting_for_audio', segments=segments[:1], processed_audio_seconds=10, backlog_seconds=10)
+    checkpoint()
+    deadline = time.monotonic() + 60
+    while True:
+        if (request_path.parent / 'stop.request').exists():
+            status['state'] = 'stopped'
+            break
+        journal = (Path(request['session_dir']) / 'timeline.jsonl').read_text(encoding='utf-8')
+        rows = [json.loads(line) for line in journal.splitlines() if line]
+        if any(row.get('kind') == 'capture_finalized' for row in rows):
+            status.update(state='complete', segments=segments, processed_audio_seconds=20, backlog_seconds=0)
+            break
+        if time.monotonic() > deadline:
+            status.update(state='failed', error='Synthetic fixture finalization timed out')
+            break
+        time.sleep(.1)
+checkpoint()
 # Keep the process alive after its checkpoint to exercise native teardown gating.
 time.sleep(0.5)
 '''
@@ -62,7 +82,7 @@ def prepare(python, output):
         'python_executable': str(python), 'worker_script': str(worker),
         'registry_path': str(registry),
         'models': {model: {'artifact_path': str(artifact)} for model in ('apex', 'trelis')},
-        'synthetic_only': True,
+        'synthetic_only': True, 'synthetic_data_root': str(output), 'synthetic_runtime_marker': 'original',
     })
     sessions = []
     for finalized in (True, False):

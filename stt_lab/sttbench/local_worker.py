@@ -20,6 +20,7 @@ import contextlib
 from sttbench.manifest import digest, file_digest, read_json, write_json
 from sttbench.normalization import basic_tokens
 from sttbench.runtime import transcribe
+from sttbench.runtime.api import warmup
 
 PROFILES = {'apex-15': ('apex', 15), 'apex-20': ('apex', 20), 'apex-30': ('apex', 30),
             'trelis-15': ('trelis', 15), 'trelis-20': ('trelis', 20)}
@@ -254,6 +255,17 @@ def run_locked(config_path: Path, request_path: Path):
     stop = job/'stop.request'
     status.pop('error', None)
     try:
+        if runtime.get('backend') == 'openvino' and not stop.exists() and parent_alive():
+            # Compile while the independent recorder accumulates its first window.
+            # No dummy inference or fabricated transcript enters the checkpoint.
+            status.update(state='running', phase='loading_model')
+            write_json(status_path, status)
+            loaded = warmup(spec, runtime)
+            status['model_startup'] = loaded
+            if loaded['status'] != 'ok':
+                raise RuntimeError('Local model could not load: ' + str(loaded.get('error')))
+            status['phase'] = 'transcribing'
+            write_json(status_path, status)
         while True:
             if stop.exists() or not parent_alive():
                 status['state'] = 'stopped'; break

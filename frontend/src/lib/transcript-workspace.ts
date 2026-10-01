@@ -17,7 +17,7 @@ export interface TranscriptWorkspace {
   profile: string | null;
   source_job_id?: string;
   source_meeting_id?: string;
-  workflow_role?: 'live-draft' | 'final' | null;
+  workflow_role?: 'live-draft' | 'final' | 'live-final' | 'fallback' | null;
   segment_metadata?: Record<string, { source_track?: string; timestamp_kind?: string; quality_flags?: string[]; alternative?: { text: string; requires_review?: boolean; reason?: string } | null }>;
   speaker_names?: Record<string, string>;
   speaker_metadata?: {

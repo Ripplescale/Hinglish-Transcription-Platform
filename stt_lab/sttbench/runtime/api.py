@@ -16,23 +16,26 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import threading
 import time
 import wave
 
-from .assets import local_path, verify_conversion_provenance, verify_model_assets
+from .assets import local_path, verify_conversion_provenance, verify_model_assets, verify_openvino_assets
 
 _CACHE: dict[tuple, tuple] = {}
 _LOCK = threading.RLock()
 _BACKENDS = {
     "transformers": ("torch", "transformers", "numpy"),
+    "openvino": ("torch", "transformers", "numpy", "openvino", "optimum.intel.openvino"),
     "whisper_cpp": (),
 }
 _OFFLINE = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
             "HF_DATASETS_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1",
-            "DO_NOT_TRACK": "1", "TOKENIZERS_PARALLELISM": "false"}
+            "DO_NOT_TRACK": "1", "TOKENIZERS_PARALLELISM": "false",
+            "NNCF_TELEMETRY_DISABLED": "1", "OPENVINO_TELEMETRY_DISABLED": "1"}
 
 
 class RuntimeFailure(Exception):
@@ -54,13 +57,18 @@ def inspect_capabilities(runtime_config: dict | None = None) -> dict:
         deps = {}
         for name in names:
             try:
-                present = importlib.util.find_spec(name) is not None
+                # find_spec on a dotted module imports its parents. Capability
+                # inspection must not import optimum.intel (and thus Torch).
+                present = importlib.util.find_spec(name.split(".")[0]) is not None
             except (ImportError, ValueError):
                 present = False
             try:
-                version = importlib.metadata.version(name.replace("_", "-")) if present else None
+                package = "optimum-intel" if name == "optimum.intel.openvino" else name.replace("_", "-")
+                version = importlib.metadata.version(package) if present else None
             except importlib.metadata.PackageNotFoundError:
                 version = None
+                if name == "optimum.intel.openvino":
+                    present = False
             deps[name] = {"installed": present, "version": version}
         supported = True
         result[backend] = {"implemented": supported, "dependencies": deps,
@@ -180,6 +188,11 @@ def _hf_whisper(spec, audio, raw, config, result):
             _CACHE[key] = (processor, model)
     result["timing"]["load_seconds"] = time.perf_counter() - load_start
     result["provenance"].update(device=device, dtype=dtype_name, model_reused=bool(cached), decoding=decoding)
+    _generate_whisper(spec, raw, config, result, processor, model, torch, np, device, dtype, decoding)
+
+
+def _generate_whisper(spec, raw, config, result, processor, model, torch, np, device, dtype, decoding):
+    """One decoder implementation for HF and OpenVINO; keep prompts identical."""
     inference_start = time.perf_counter()
     samples = np.frombuffer(raw, dtype="<i2").astype("float32") / 32768.0
     inputs = processor(samples, sampling_rate=16000, return_tensors="pt", return_attention_mask=True)
@@ -262,6 +275,98 @@ def _hf_whisper(spec, audio, raw, config, result):
     result["timing"]["inference_seconds"] = time.perf_counter() - inference_start
 
 
+def _openvino_execution_devices(model, requested: str) -> dict:
+    """Read the compiled graphs, rather than report only a device request."""
+    found = {}
+    components = getattr(model, "components", {})
+    if not isinstance(components, dict) or not {"encoder", "decoder"}.issubset(components):
+        raise RuntimeFailure("device_unverified", "OpenVINO did not expose both compiled Whisper components.", "unavailable")
+    for name, component in components.items():
+        request = getattr(component, "request", None)
+        compiled = request.get_compiled_model() if hasattr(request, "get_compiled_model") else request
+        try:
+            devices = [str(device).upper() for device in compiled.get_property("EXECUTION_DEVICES")]
+        except (AttributeError, RuntimeError, TypeError) as exc:
+            raise RuntimeFailure("device_unverified", f"Cannot verify OpenVINO execution device for {name}.", "unavailable") from exc
+        if not devices or any(not re.fullmatch(r"GPU(?:\.\d+)?", device) for device in devices):
+            raise RuntimeFailure("device_mismatch", f"OpenVINO {name} compiled on {devices}; explicit GPU execution is required.", "unavailable")
+        if requested != "GPU" and any(device != requested for device in devices):
+            raise RuntimeFailure("device_mismatch", f"OpenVINO {name} did not compile on requested {requested}.", "unavailable")
+        found[name] = devices
+    return found
+
+
+def _openvino_whisper(spec, audio, raw, config, result):
+    decoding = _decoding(spec)
+    if config.get("timestamps"):
+        raise RuntimeFailure("timestamps_unsupported", "OpenVINO qualification is text-only; playback uses input-window boundaries, not aligned word timestamps.", "unavailable")
+    device = str(config.get("device", "GPU")).upper()
+    if not re.fullmatch(r"GPU(?:\.\d+)?", device):
+        raise RuntimeFailure("device_unsupported", "This OpenVINO profile requires explicit GPU or GPU.n; AUTO, CPU, and silent fallback are disabled.", "unavailable")
+    if config.get("dtype", "float16") != "float16":
+        raise RuntimeFailure("dtype_unsupported", "This OpenVINO export is qualified for float16 inference only.", "unavailable")
+    if _positive(config.get("num_beams", decoding.get("num_beams", 1)), "num_beams", integer=True) != 1:
+        raise RuntimeFailure("decoder_mismatch", "This OpenVINO profile is qualified for greedy decoding (num_beams=1) only.", "unavailable")
+    cache_dir = local_path(config.get("cache_dir"))
+    if not cache_dir.is_dir():
+        raise RuntimeFailure("cache_dir_missing", "Create a local OpenVINO cache_dir during setup.", "unavailable")
+    conversion = result["provenance"]["conversion"]
+    packages = conversion["metadata"]["converter"]["packages"]
+    installed = {}
+    for name, version in packages.items():
+        try:
+            installed[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise RuntimeFailure("dependency_missing", f"Missing pinned OpenVINO dependency: {name}=={version}.", "unavailable") from exc
+        if installed[name] != version:
+            raise RuntimeFailure("dependency_version_mismatch", f"OpenVINO requires the verified {name}=={version}; installed {installed[name]}.", "unavailable")
+    torch, transformers, np, ov, optimum = (_load_dependency(name) for name in _BACKENDS["openvino"])
+    if "threads" in config:
+        torch.set_num_threads(_positive(config["threads"], "threads", integer=True))
+    ov_config = {"PERFORMANCE_HINT": "LATENCY", "INFERENCE_PRECISION_HINT": "f16", "CACHE_DIR": str(cache_dir)}
+    target = conversion["export_path"]
+    key = ("openvino", spec["artifact_path"], spec.get("source_revision"), target,
+           conversion["sidecar_sha256"], conversion["export_manifest_sha256"], device, str(cache_dir))
+    load_start = time.perf_counter()
+    cached = _CACHE.get(key) if config.get("reuse_model", True) else None
+    result["timing"]["compile_seconds"] = 0.0
+    if cached:
+        processor, model = cached
+    else:
+        available = [str(item).upper() for item in ov.Core().available_devices]
+        if not any(item == device or (device == "GPU" and re.fullmatch(r"GPU(?:\.\d+)?", item)) for item in available):
+            raise RuntimeFailure("device_unavailable", f"Requested OpenVINO {device} is unavailable; no CPU fallback was attempted.", "unavailable")
+        processor = transformers.AutoProcessor.from_pretrained(spec["artifact_path"], local_files_only=True, trust_remote_code=False)
+        model_config = transformers.AutoConfig.from_pretrained(target, local_files_only=True, trust_remote_code=False)
+        # In pinned optimum-intel 2.2.0 the public loader tries HF-cache discovery
+        # even for an absolute Windows directory, then may auto-export. This
+        # local-only loader dispatches Whisper from verified IR without either.
+        model = optimum.OVModelForSpeechSeq2Seq._from_pretrained(
+            target, config=model_config, device=device, compile=False, local_files_only=True,
+            trust_remote_code=False, load_in_8bit=False, ov_config=ov_config,
+        )
+        result["timing"]["load_seconds"] = time.perf_counter() - load_start
+        compile_start = time.perf_counter()
+        try:
+            model.compile()
+        finally:
+            result["timing"]["compile_seconds"] = time.perf_counter() - compile_start
+    if cached:
+        result["timing"]["load_seconds"] = time.perf_counter() - load_start
+    execution = _openvino_execution_devices(model, device)
+    if not cached and config.get("reuse_model", True):
+        _CACHE[key] = (processor, model)
+    result["provenance"].update(device=device, device_requested=device, execution_devices=execution,
+                                dtype="float16", tensor_device="cpu", tensor_dtype="float32",
+                                model_reused=bool(cached), decoding=decoding, packages=installed,
+                                ov_config=ov_config, export_path=target, timestamp_kind="input_window_only")
+    # Optimum wraps GPU inference with CPU tensors. No Torch device transfer or
+    # float16 CPU inference is implied by OpenVINO's FP16 graph execution.
+    if raw is not None:
+        _generate_whisper(spec, raw, {**config, "num_beams": 1}, result, processor, model,
+                          torch, np, "cpu", torch.float32, decoding)
+
+
 def _whisper_cpp(spec, audio, raw, config, result):
     decoding = _decoding(spec)
     if decoding.get("mixed_code"):
@@ -333,6 +438,15 @@ def _whisper_cpp(spec, audio, raw, config, result):
 
 def transcribe(model_spec: dict, audio_path: Path, runtime_config: dict | None = None) -> dict:
     """Transcribe one local normalized WAV clip, returning explicit failure state."""
+    return _run(model_spec, audio_path, runtime_config)
+
+
+def warmup(model_spec: dict, runtime_config: dict | None = None) -> dict:
+    """Validate and compile OpenVINO once; does not infer or emit a transcript."""
+    return _run(model_spec, None, runtime_config, warmup_only=True)
+
+
+def _run(model_spec, audio_path, runtime_config, *, warmup_only=False):
     started = time.perf_counter()
     config = dict(runtime_config or {})
     spec = dict(model_spec)
@@ -342,9 +456,14 @@ def transcribe(model_spec: dict, audio_path: Path, runtime_config: dict | None =
               "provenance": {"backend": backend, "model_id": spec.get("model_id"), "repo_id": spec.get("repo_id"),
                              "source_revision": spec.get("source_revision"), "mode": "batch", "offline": True,
                              "live_latency_verified": False}}
+    if warmup_only:
+        result["operation"] = "warmup"
+        result["provenance"]["mode"] = "load_compile_only"
     try:
         if backend not in _BACKENDS:
             raise RuntimeFailure("backend_unknown", f"Unknown ASR backend: {backend}", "unavailable")
+        if warmup_only and backend != "openvino":
+            raise RuntimeFailure("warmup_unsupported", "Load/compile warmup is implemented only for OpenVINO.", "unavailable")
         if "artifact_path" in config:
             spec["artifact_path"] = config["artifact_path"]
         if backend == "whisper_cpp" and "model_path" in config:
@@ -357,13 +476,22 @@ def transcribe(model_spec: dict, audio_path: Path, runtime_config: dict | None =
             raise RuntimeFailure("model_assets_invalid", "; ".join(verification["issues"]), "unavailable")
         spec["artifact_path"] = verification["artifact_path"]
         result["provenance"]["artifact_path"] = spec["artifact_path"]
-        audio = local_path(audio_path)
-        raw, duration = _read_pcm(audio)
-        result["audio_seconds"] = duration
+        if backend == "openvino":
+            conversion_started = time.perf_counter()
+            conversion = verify_openvino_assets(spec, config.get("export_path"), verification)
+            result["timing"]["conversion_verification_seconds"] = time.perf_counter() - conversion_started
+            result["provenance"]["conversion"] = conversion
+            if not conversion["ok"]:
+                raise RuntimeFailure("conversion_unverified", "; ".join(conversion["issues"]), "unavailable")
+        audio, raw = None, None
+        if not warmup_only:
+            audio = local_path(audio_path)
+            raw, duration = _read_pcm(audio)
+            result["audio_seconds"] = duration
         # Environment variables and cached model objects are process-global.
         # Serialize calls; use separate worker processes for parallel benchmarks.
         with _LOCK, _offline_environment():
-            {"transformers": _hf_whisper, "whisper_cpp": _whisper_cpp}[backend](spec, audio, raw, config, result)
+            {"transformers": _hf_whisper, "whisper_cpp": _whisper_cpp, "openvino": _openvino_whisper}[backend](spec, audio, raw, config, result)
         for segment in result["segments"]:
             if not (0 <= segment["start"] <= segment["end"] <= duration + 0.1):
                 result["diagnostics"] = {"rejected_text": result["text"], "rejected_segments": copy.deepcopy(result["segments"]),
