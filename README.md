@@ -12,7 +12,7 @@ Hinglish Transcription Platform is a local Windows desktop app for recording cal
 
 ## What it does
 
-- Opens in a compact 920 × 740 window. The home screen groups notes by project; **New note** immediately starts recording and opens a clean writing space.
+- Opens in a narrow 680 × 820 window, adjusted to fit the screen. Maximize extends it vertically while retaining its current width; Restore returns to the prior size. The home screen groups notes by project; **New note** immediately starts recording and opens a clean writing space.
 - Autosaves notes locally. The microphone/up-arrow **Transcript** control reveals recognition when needed; playback, corrections, versions and export remain available.
 - Provides **Project memory**: source-linked saved-note excerpts and checked project references. It does not generate facts or infer a knowledge graph from unverified speech.
 - Records microphone and system audio into separate local tracks, with a recovery journal written before transcription.

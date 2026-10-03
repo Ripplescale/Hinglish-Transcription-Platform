@@ -2,7 +2,7 @@
     "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
     "productName": "xx",
     "mainBinaryName": "xx",
-    "version": "0.7.0",
+    "version": "0.7.1",
     "identifier": "com.sttapp.local",
     "build": {
         "frontendDist": "../out",
@@ -14,9 +14,9 @@
         "windows": [
             {
                 "title": "xx",
-                "width": 920,
-                "height": 740,
-                "minWidth": 720,
+                "width": 680,
+                "height": 820,
+                "minWidth": 600,
                 "minHeight": 560,
                 "preventOverflow": true,
                 "center": true,

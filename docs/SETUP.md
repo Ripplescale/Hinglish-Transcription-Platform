@@ -6,6 +6,8 @@ xx is currently a Windows x64 application with a separately prepared local model
 
 Close any running instance of xx normally before upgrading, then run the locally supplied xx setup program and open **xx** from Start. The upgrade retains the existing local workspace. Opening xx shows your notes without starting recording.
 
+The default window is a narrow 680 × 820 writing space, fitted to the available screen. Windows' maximize button extends it to the top and bottom of the usable display while keeping its current width. Restore returns to the previous size and position. Drag a side edge to choose another width.
+
 The install includes the desktop application, FFmpeg, and required Microsoft C++ runtime files. It reuses the existing local models and Python environments. Its adjacent `sttapp-local-install.json` points to the data root; do not commit this machine-specific file.
 
 1. Check the local runtime status, microphone, and system-audio device.

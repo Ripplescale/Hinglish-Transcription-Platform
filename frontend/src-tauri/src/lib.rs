@@ -56,6 +56,8 @@ pub mod summary;
 pub mod tray;
 pub mod utils;
 pub mod whisper_engine;
+#[cfg(target_os = "windows")]
+mod window_layout;
 
 use audio::{list_audio_devices, AudioDevice, trigger_audio_permission};
 use log::{error as log_error, info as log_info};
@@ -476,6 +478,17 @@ pub fn run() {
         .manage(audio::init_system_audio_state())
         .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
         .setup(|_app| {
+            #[cfg(target_os = "windows")]
+            if let Some(window) = _app.get_webview_window("main") {
+                // Install on the window's GUI thread so native maximize keeps
+                // the writing column's width while Windows owns restore state.
+                match window.hwnd() {
+                    Ok(hwnd) => if let Err(error) = unsafe { window_layout::install(hwnd.0) } {
+                        log::warn!("Could not enable vertical maximize: {error}");
+                    },
+                    Err(error) => log::warn!("Could not access main window: {error}"),
+                }
+            }
             // Capture and the isolated selected-model worker do not use the
             // legacy in-process ONNX/Whisper engines. Avoid loading extra models.
 

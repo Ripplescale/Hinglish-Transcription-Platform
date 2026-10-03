@@ -51,7 +51,7 @@ async function main() {
     assert.equal(await page.locator('audio').count(), 1);
     report.checks.push('Saved meeting opens directly to notes, transcript collapsed, one persistent audio player');
 
-    for (const [width, height] of [[720, 560], [920, 740]]) {
+    for (const [width, height] of [[680, 820], [600, 560], [720, 560], [920, 740]]) {
       await page.setViewportSize({ width, height });
       await page.waitForTimeout(250);
       const layout = await page.evaluate(() => {

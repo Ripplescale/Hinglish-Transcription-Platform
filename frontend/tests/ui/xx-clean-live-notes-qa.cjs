@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const { installFixture } = require('./xx-fixture.cjs');
+const laptopSizes = [[680, 820], [600, 560], [720, 560], [920, 740], [1366, 768]];
 
 async function installCleanLiveFixture(page) {
   await installFixture(page);
@@ -194,6 +195,12 @@ async function main() {
       const dock = await page.locator('.xx-note-dock').boundingBox();
       assert.ok(textarea && dock && textarea.height >= 79 && textarea.y + textarea.height <= dock.y + 1, `Writing surface is clipped or overlaps controls at ${width}x${height}: ${JSON.stringify({ textarea, dock })}`);
       assert.ok(dock.x >= -1 && dock.x + dock.width <= width + 1 && dock.y + dock.height <= height + 1, `Dock is outside window at ${width}x${height}`);
+      for (const control of await page.locator('.xx-note-dock button, .xx-note-dock > details > summary').all()) {
+        if (!await control.isVisible()) continue;
+        const box = await control.boundingBox();
+        assert.ok(box && box.x >= dock.x - 1 && box.x + box.width <= dock.x + dock.width + 1 && box.y >= dock.y - 1 && box.y + box.height <= dock.y + dock.height + 1, `Recording control is clipped at ${width}x${height}: ${await control.getAttribute('aria-label')}`);
+        assert.ok(box.width >= 28 && box.height >= 30, `Recording control is too small at ${width}x${height}`);
+      }
     }
     await screen(`${label}-${width}x${height}.png`);
   };
@@ -220,8 +227,8 @@ async function main() {
     const newNoteBounds = await page.locator('.xx-library-header').getByRole('button', { name: 'New note', exact: true }).boundingBox();
     const headingBounds = await page.getByRole('heading', { name: 'Your notes', exact: true }).boundingBox();
     assert.ok(newNoteBounds.x > headingBounds.x && Math.abs(newNoteBounds.y - headingBounds.y) < 75, 'New note is in the header at the right');
-    for (const [width, height] of [[920, 740], [720, 560], [1366, 768]]) await checkSize('home', width, height);
-    report.checks.push('Home groups fictional recordings into projects and Unfiled, with one top-right New note action at three laptop sizes');
+    for (const [width, height] of laptopSizes) await checkSize('home', width, height);
+    report.checks.push('Home groups fictional recordings into projects and Unfiled, with one top-right New note action at narrow and standard laptop sizes');
     await page.getByRole('textbox', { name: 'Search notes', exact: true }).fill('sketchbooks');
     assert.equal(await page.locator('.xx-note-row').count(), 1);
     await page.getByRole('button', { name: 'Clear note search', exact: true }).click();
@@ -259,12 +266,12 @@ async function main() {
     assert.deepEqual(saveCalls.map(call => call.args.expectedRevision), saveCalls.map((_, index) => index));
     assert.deepEqual(firstSaved.corrections, []);
     report.checks.push('Live note and selected project autosave with sequential expected revisions, leaving correction data separate');
-    for (const [width, height] of [[920, 740], [720, 560], [1366, 768]]) await checkSize('live-collapsed', width, height);
+    for (const [width, height] of laptopSizes) await checkSize('live-collapsed', width, height);
     await page.evaluate(() => window.qaCleanSetText());
     await page.getByRole('button', { name: 'Show transcript', exact: true }).click();
     await page.getByText('आज Project Willow की workshop plan करते हैं. We need 24 sketchbooks.', { exact: true }).waitFor();
     assert.equal(await page.locator('#live-transcript-drawer').isVisible(), true);
-    for (const [width, height] of [[920, 740], [720, 560], [1366, 768]]) await checkSize('live-transcript', width, height);
+    for (const [width, height] of laptopSizes) await checkSize('live-transcript', width, height);
     await page.locator('.xx-transcript-toggle').click();
     assert.equal(await page.locator('#live-transcript-drawer').isVisible(), false);
     report.checks.push('Transcript control reveals unchanged mixed Devanagari/Latin text on demand, then hides it while preserving notes and reachable recording controls');
