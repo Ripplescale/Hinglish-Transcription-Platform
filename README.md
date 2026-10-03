@@ -16,6 +16,7 @@ Hinglish Transcription Platform is a local Windows desktop app for recording cal
 - Autosaves notes locally. The microphone/up-arrow **Transcript** control reveals recognition when needed; playback, corrections, versions and export remain available.
 - Provides **Project memory**: source-linked saved-note excerpts and checked project references. It does not generate facts or infer a knowledge graph from unverified speech.
 - Records microphone and system audio into separate local tracks, with a recovery journal written before transcription.
+- Offers a small **Record call / Dismiss** prompt when Zoom or Teams desktop activates its microphone. Recording starts only after you choose; no calendar connection is needed. [Detection limits and settings](docs/MEETING_DETECTION.md).
 - Runs **Trelis · 20 seconds · OpenVINO GPU FP16** during the call, preserving its original Hindi/English script. The same job finishes any remaining saved audio after you stop; there is no second full transcription pass.
 - Offers **Apex · 20 seconds** as an explicit fallback. Trelis pauses after its current window, then Apex replays the saved audio into a separate Roman Hinglish version.
 - Retains raw output, separate corrections, and history. “Final transcript” means the Trelis job completed; it remains unreviewed machine output until you check it.
