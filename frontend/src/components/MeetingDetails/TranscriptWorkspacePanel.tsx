@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type RefObject } from 'react';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import type { Transcript } from '@/types';
@@ -16,7 +16,7 @@ import { useRouter } from 'next/navigation';
 type Review = ReturnType<typeof useTranscriptWorkspace>;
 interface TranscriptLayer { meeting_id: string; title: string; profile?: string | null; workflow_role?: WorkflowRole | null; job_id?: string | null; state: string; primary: boolean }
 
-export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMore, totalCount, onLoadMore, onDraftChange }: {
+export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMore, totalCount, onLoadMore, onDraftChange, compact = false, playback }: {
   meeting: { id: string; title: string; created_at?: string; transcripts: Transcript[] };
   review: Review;
   hasMore?: boolean;
@@ -24,6 +24,8 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
   totalCount?: number;
   onLoadMore?: () => void;
   onDraftChange?: (dirty: boolean) => void;
+  compact?: boolean;
+  playback?: { audio: RefObject<HTMLAudioElement>; path: string | null; onError: (message: string) => void };
 }) {
   const [audioPath, setAudioPath] = useState<string | null>(null);
   const [audioError, setAudioError] = useState<string | null>(null);
@@ -44,7 +46,9 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
   const processing = run?.job && !isTerminalJob(run.job.state);
   const liveState = run?.job?.state ?? activeLayer?.state;
   const liveTitle = liveState === 'complete' ? 'Final transcript' : !run?.recording && !isTerminalJob(liveState ?? 'queued') && !!run?.captureEnded ? 'Finishing transcript' : 'Live transcript';
-  const audio = useRef<HTMLAudioElement>(null);
+  const internalAudio = useRef<HTMLAudioElement>(null);
+  const audio = playback?.audio ?? internalAudio;
+  const playablePath = playback ? playback.path : audioPath;
   const profileId = review.workspace.profile || activeLayer?.profile;
   const transcriptProfile = profileId === 'apex-20' ? 'Apex · 20s' : profileId === 'trelis-20' ? 'Trelis · 20s' : null;
   const layerRefresh = state.runs.map(item => `${item.transcriptMeetingId}:${item.job?.job_id}:${item.job?.state}`).join('|');
@@ -86,6 +90,7 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
   }, [meeting.id, meeting.title]);
 
   useEffect(() => {
+    if (playback) return;
     let cancelled = false;
     setAudioPath(null);
     setAudioError(null);
@@ -93,7 +98,7 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
       .then(result => { if (!cancelled) setAudioPath(result.path); })
       .catch(reason => { if (!cancelled) setAudioError(`Recording unavailable: ${String(reason)}`); });
     return () => { cancelled = true; };
-  }, [meeting.id, run?.recording]);
+  }, [meeting.id, run?.recording, !!playback]);
 
   const exportTranscript = async (format: 'txt' | 'md' | 'json' | 'claude', handoff?: 'chat' | 'cowork') => {
     setExporting(true);
@@ -128,13 +133,13 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
   const seek = (seconds: number) => {
     if (!audio.current || !Number.isFinite(seconds) || seconds < 0) return;
     audio.current.currentTime = seconds;
-    void audio.current.play().catch(reason => setAudioError(String(reason)));
+    void audio.current.play().catch(reason => playback ? playback.onError(String(reason)) : setAudioError(String(reason)));
   };
 
   return <section className="flex h-full min-h-0 min-w-0 flex-col bg-[var(--xx-paper)] text-[var(--xx-ink)]" aria-label="Transcript review">
-    <header className="shrink-0 border-b border-[var(--xx-border)] px-5 pt-5 pb-4 space-y-3">
+    <header className={`shrink-0 border-b border-[var(--xx-border)] px-5 ${compact ? 'pt-4 pb-3 space-y-2 max-h-[45%] overflow-y-auto' : 'pt-5 pb-4 space-y-3'}`}>
       <div className="xx-eyebrow flex items-center gap-2"><FileText size={13} aria-hidden="true" />{activeRole === 'fallback' ? 'Apex fallback' : activeRole === 'live-final' ? liveTitle : activeRole === 'live-draft' ? 'Live draft' : activeRole === 'final' ? 'Final transcript' : 'Transcript'}</div>
-      <h1 className="text-[24px] leading-tight font-normal [font-family:Georgia,serif] break-words">{displayTitle}</h1>
+      {!compact && <h1 className="text-[24px] leading-tight font-normal [font-family:Georgia,serif] break-words">{displayTitle}</h1>}
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-[11px] text-[var(--xx-muted)]">{transcriptProfile ? <span className="font-medium text-[var(--xx-accent)]">Transcript: {transcriptProfile}</span> : 'Original script'}<span className="mx-2">·</span>{totalCount ?? meeting.transcripts.length} segments</p>
         <DropdownMenu><DropdownMenuTrigger asChild><button type="button" className="xx-button-secondary !min-h-8 !px-3 text-xs" disabled={exporting || !review.loaded || editing !== null}><Download size={13} aria-hidden="true" />{exporting ? 'Preparing…' : 'Export'}<ChevronDown size={12} aria-hidden="true" /></button></DropdownMenuTrigger>
@@ -171,7 +176,7 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
         const stale = review.workspace.corrections.some(item => item.segment_id === segment.id && item.original_text !== segment.text);
         return <article key={segment.id} className="group border-b border-[var(--xx-border)] last:border-0 py-4 space-y-2">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-[var(--xx-muted)]">
-            <button type="button" className="rounded px-1 -ml-1 font-mono text-[var(--xx-accent)] hover:bg-[var(--xx-canvas)] focus-visible:outline focus-visible:outline-2 disabled:opacity-40" disabled={!audioPath || segment.audio_start_time == null} onClick={() => seek(segment.audio_start_time!)} title="Play from this segment boundary">{recordingTime(segment.audio_start_time)}</button>
+            <button type="button" className="rounded px-1 -ml-1 font-mono text-[var(--xx-accent)] hover:bg-[var(--xx-canvas)] focus-visible:outline focus-visible:outline-2 disabled:opacity-40" disabled={!playablePath || segment.audio_start_time == null} onClick={() => seek(segment.audio_start_time!)} title="Play from this segment boundary">{recordingTime(segment.audio_start_time)}</button>
             {track && <span>{track === 'microphone' ? 'Microphone' : track === 'system' ? 'Computer audio' : `${track} track`}</span>}
             {segment.speaker_id && <span>{segment.speaker_id}</span>}
             {corrected && <span className="text-emerald-700">Corrected</span>}
@@ -190,10 +195,10 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
       })}
       {hasMore && <Button variant="outline" className="w-full" disabled={isLoadingMore} onClick={onLoadMore}>{isLoadingMore ? 'Loading…' : 'Load more transcript'}</Button>}
     </div>
-    <footer className="shrink-0 border-t border-[var(--xx-border)] px-4 py-3 space-y-2 bg-[var(--xx-paper)]">
+    {!playback && <footer className="shrink-0 border-t border-[var(--xx-border)] px-4 py-3 space-y-2 bg-[var(--xx-paper)]">
       <div className="flex items-center justify-between gap-3 text-[11px] text-[var(--xx-muted)]"><span className="flex items-center gap-2"><Headphones size={13} aria-hidden="true" /> Recording</span><span className="inline-flex items-center gap-1" title="Times identify audio windows, not individual words. Track labels do not identify people. Original recognition script is preserved."><Info size={12} aria-hidden="true" /> Window timestamps</span></div>
       {audioPath ? <audio ref={audio} key={audioPath} controls preload="metadata" src={convertFileSrc(audioPath)} className="w-full h-10" onError={() => setAudioError('The saved audio could not be played. Open its recording folder to inspect it.')} /> : <p className="text-xs text-gray-500">No playable recording is linked to this meeting.</p>}
       {audioError && <p role="alert" className="text-xs text-amber-700">{audioError}</p>}
-    </footer>
+    </footer>}
   </section>;
 }

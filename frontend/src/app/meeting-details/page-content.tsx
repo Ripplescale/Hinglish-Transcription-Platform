@@ -1,14 +1,14 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { Check, ChevronDown, NotebookPen, Settings2 } from 'lucide-react';
+import { Check, ChevronDown, ChevronUp, Folder, Mic, Settings2 } from 'lucide-react';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { Popover, PopoverTrigger } from '@/components/ui/popover';
 import { Portal as ToolsPortal, Content as ToolsContent } from '@radix-ui/react-popover';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { useRouter } from 'next/navigation';
 import { toast } from 'sonner';
 import type { MeetingSummary, SummaryProcessResponse } from '@/types';
-import { MeetingDetailsSplitView, type MeetingDetailsTab } from '@/components/MeetingDetails/MeetingDetailsSplitView';
 import { TranscriptWorkspacePanel } from '@/components/MeetingDetails/TranscriptWorkspacePanel';
 import { BlockNoteSummaryView } from '@/components/AISummary/BlockNoteSummaryView';
 import { useMeetingData } from '@/hooks/meeting-details/useMeetingData';
@@ -18,6 +18,10 @@ import { Button } from '@/components/ui/button';
 import { ProjectVaultPanel } from '@/components/ProjectVaultPanel';
 import { LocalTranscriptionPanel } from '@/components/LocalTranscriptionPanel';
 import { SpeakerReviewPanel } from '@/components/MeetingDetails/SpeakerReviewPanel';
+import { useLocalWorkflow } from '@/contexts/LocalWorkflowContext';
+import { projectLabel, useProjectLibrary } from '@/hooks/useProjectLibrary';
+import { isTerminalJob } from '@/lib/local-transcription-workflow';
+import './saved-note.css';
 
 export default function PageContent({ meeting, summaryData, onMeetingUpdated, hasMore, isLoadingMore, totalCount, onLoadMore }: {
   meeting: any;
@@ -34,18 +38,52 @@ export default function PageContent({ meeting, summaryData, onMeetingUpdated, ha
   loadedCount?: number;
   onLoadMore?: () => void;
 }) {
-  const [activeTab, setActiveTab] = useState<MeetingDetailsTab>('transcript');
+  const [transcriptOpen, setTranscriptOpen] = useState(false);
+  const [displayTitle, setDisplayTitle] = useState(meeting.title);
+  const { projects, error: projectError } = useProjectLibrary();
+  const [audioPath, setAudioPath] = useState<string | null>(null);
+  const [audioError, setAudioError] = useState<string | null>(null);
+  const audio = useRef<HTMLAudioElement>(null);
   const [correctionDraft, setCorrectionDraft] = useState(false);
   const [pendingNavigation, setPendingNavigation] = useState<{ href: string; historyDelta?: number } | null>(null);
   const router = useRouter();
   const review = useTranscriptWorkspace(meeting.id);
+  const { state } = useLocalWorkflow();
+  const run = state.runs.find(item => item.transcriptMeetingId === meeting.id) ?? state.runs.find(item => item.primary && item.meetingId === meeting.id);
+  const recording = run?.recording;
+  const transcriptionError = run?.error || run?.job?.error;
+  const finishing = !!run?.job && !isTerminalJob(run.job.state) && !recording;
   const draftNotes = 'workflow_role' in review.workspace && review.workspace.workflow_role === 'live-draft';
   const fallbackNotes = review.workspace.workflow_role === 'fallback';
   const legacy = useMeetingData({ meeting, summaryData, onMeetingUpdated });
   const save = async () => {
-    try { await review.save(); toast.success('Notes and corrections saved'); }
+    try { await review.save(); window.dispatchEvent(new Event('xx-projects-updated')); toast.success('Notes and corrections saved'); }
     catch { /* The persistent error retains unsaved edits in the workspace. */ }
   };
+  useEffect(() => {
+    setDisplayTitle(meeting.title);
+    const renamed = (event: Event) => {
+      const detail = (event as CustomEvent<{ id: string; title: string }>).detail;
+      if (detail.id === meeting.id || detail.id === review.workspace.source_meeting_id) setDisplayTitle(detail.title);
+    };
+    window.addEventListener('xx-meeting-renamed', renamed);
+    return () => window.removeEventListener('xx-meeting-renamed', renamed);
+  }, [meeting.id, meeting.title, review.workspace.source_meeting_id]);
+  useEffect(() => {
+    let cancelled = false;
+    setAudioPath(null); setAudioError(null);
+    invoke<{ path: string | null }>('local_get_meeting_audio', { meetingId: meeting.id })
+      .then(result => { if (!cancelled) setAudioPath(result.path); })
+      .catch(reason => { if (!cancelled) setAudioError(`Recording unavailable: ${String(reason)}`); });
+    return () => { cancelled = true; };
+  }, [meeting.id, recording]);
+  useEffect(() => {
+    // Correction drafts live inside the transcript panel until explicitly applied.
+    // The workspace save merges edits typed during a save and stops on revision conflicts.
+    if (!review.loaded || !review.dirty || review.saving || review.error || correctionDraft) return;
+    const timer = window.setTimeout(() => { void review.save().then(() => window.dispatchEvent(new Event('xx-projects-updated'))).catch(() => { /* Persistent error + explicit retry. */ }); }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [review.loaded, review.dirty, review.saving, review.error, review.workspace, review.save, correctionDraft]);
   const saveCurrent = useRef(save);
   saveCurrent.current = save;
   const saveEnabled = useRef(false);
@@ -128,14 +166,12 @@ export default function PageContent({ meeting, summaryData, onMeetingUpdated, ha
     window.addEventListener('keydown', keyboardSave);
     return () => window.removeEventListener('keydown', keyboardSave);
   }, [meeting.id]);
-  return <div className="flex h-full min-h-0 min-w-0 flex-col p-4 pl-1">
-    <MeetingDetailsSplitView activeTab={activeTab} onTabChange={setActiveTab}
-      transcript={<TranscriptWorkspacePanel meeting={meeting} review={review} hasMore={hasMore} isLoadingMore={isLoadingMore} totalCount={totalCount} onLoadMore={onLoadMore} onDraftChange={setCorrectionDraft} />}
-      summary={<section className="flex h-full min-h-0 min-w-0 flex-col bg-[var(--xx-paper)] text-[var(--xx-ink)]" aria-label="Meeting notes">
-        <header className="shrink-0 px-5 pt-5 pb-4 border-b border-[var(--xx-border)] space-y-4">
-          <div className="flex items-center justify-between gap-2"><h2 className="xx-eyebrow flex items-center gap-2"><NotebookPen size={13} aria-hidden="true" />{fallbackNotes ? 'Notes for this fallback' : draftNotes ? 'Notes for this draft' : 'My notes'}</h2>
+  return <div className="xx-saved-note">
+    <section className="xx-saved-note-sheet" aria-label="Meeting notes">
+        <header className="xx-saved-note-header">
+          <div className="xx-saved-note-title-row"><h1 className="xx-heading xx-saved-note-title">{displayTitle}</h1>
             <Popover><PopoverTrigger asChild><button type="button" className="xx-button-secondary !min-h-8 !px-2 text-xs"><Settings2 size={13} aria-hidden="true" />Tools<ChevronDown size={12} aria-hidden="true" /></button></PopoverTrigger>
-              <ToolsPortal forceMount><ToolsContent forceMount align="end" sideOffset={10} aria-label="Meeting tools" className="data-[state=closed]:hidden z-50 border shadow-lg outline-none w-[380px] max-h-[min(680px,calc(100vh-120px))] overflow-y-auto rounded-2xl border-[var(--xx-border)] bg-[var(--xx-paper)] p-4 text-[var(--xx-ink)] space-y-3">
+              <ToolsPortal forceMount><ToolsContent forceMount align="end" sideOffset={10} aria-label="Meeting tools" className="data-[state=closed]:hidden z-50 border shadow-lg outline-none w-[380px] max-w-[calc(100vw-32px)] max-h-[min(680px,calc(100vh-120px))] overflow-y-auto rounded-2xl border-[var(--xx-border)] bg-[var(--xx-paper)] p-4 text-[var(--xx-ink)] space-y-3">
                 <div><h3 className="font-medium text-sm">Meeting tools</h3><p className="mt-1 text-xs text-[var(--xx-muted)]">Fine-tune this meeting when you need to.</p></div>
                 <details className="rounded-xl border border-[var(--xx-border)] p-3"><summary className="cursor-pointer text-sm font-medium">Transcription &amp; versions</summary><div className="mt-3"><LocalTranscriptionPanel sessionDir={meeting.folder_path} meetingId={meeting.id} projectId={review.workspace.project_id} /></div></details>
                 <SpeakerReviewPanel meetingId={meeting.id} review={review} />
@@ -144,12 +180,29 @@ export default function PageContent({ meeting, summaryData, onMeetingUpdated, ha
               </ToolsContent></ToolsPortal>
             </Popover>
           </div>
-          <div className="flex items-center justify-between gap-2"><span role="status" className="text-[11px] text-[var(--xx-muted)] flex items-center gap-1.5">{!review.loaded ? 'Loading notes…' : review.saving ? 'Saving…' : review.dirty ? <><span className="h-1.5 w-1.5 rounded-full bg-[var(--xx-accent)]" />Unsaved changes</> : <><Check size={12} aria-hidden="true" />Saved on this device</>}</span><button type="button" className="xx-button-primary !min-h-8 !px-3 text-xs" title="Save notes and corrections (Ctrl+S)" disabled={!review.loaded || review.saving || !review.dirty} onClick={() => void save()}>{review.saving ? 'Saving…' : 'Save changes'}</button></div>
+          <div className="xx-saved-note-meta">
+            <label className="xx-saved-note-project"><Folder size={13} aria-hidden="true" /><select aria-label="Meeting project" title={projectError ?? 'Organize this note by project'} disabled={!review.loaded || review.saving || !!projectError} value={review.workspace.project_id ?? ''} onChange={event => review.updateProject(event.target.value || null)}><option value="">No project</option>{review.workspace.project_id && !projects.some(project => project.id === review.workspace.project_id) && <option value={review.workspace.project_id}>{review.workspace.project_id}</option>}{projects.map(project => <option key={project.id} value={project.id}>{projectLabel(project.name)}</option>)}</select></label>
+            <span className="xx-saved-note-layer">{fallbackNotes ? 'Notes for this fallback' : draftNotes ? 'Notes for this draft' : 'My notes'}</span>
+            <span role="status" className="xx-saved-note-status">{!review.loaded ? 'Loading…' : review.saving ? 'Saving…' : review.error ? 'Not saved' : correctionDraft ? 'Correction in progress' : review.dirty ? 'Unsaved changes' : <><Check size={12} aria-hidden="true" />Saved</>}</span>
+            {(review.error || (review.dirty && correctionDraft)) && <button type="button" className="xx-button-secondary !min-h-7 !py-1 !px-2 text-xs" title="Save notes and applied corrections (Ctrl+S)" disabled={!review.loaded || review.saving || !review.dirty} onClick={() => void save()}>Save changes</button>}
+          </div>
         </header>
-        {review.error && <p role="alert" className="mx-5 mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-700">{review.error}</p>}
-        <textarea aria-label="Meeting notes" placeholder={'A little space for your thoughts.\n\nJot down ideas, decisions or next steps — or paste your refined summary here.'} className="flex-1 min-h-0 w-full resize-none border-0 bg-transparent p-5 text-[15px] leading-[1.9] placeholder:text-[var(--xx-muted)] focus:outline-none focus-visible:shadow-[inset_0_0_0_2px_var(--xx-border)]" disabled={!review.loaded} value={review.workspace.notes} onChange={event => review.updateNotes(event.target.value)} />
-        <footer className="shrink-0 px-5 py-3 border-t border-[var(--xx-border)] text-[11px] text-[var(--xx-muted)] flex items-center justify-between gap-2"><span>{draftNotes || fallbackNotes ? 'Notes and corrections stay with this version.' : 'Your notes, in your words.'}</span><kbd className="shrink-0 rounded border border-[var(--xx-border)] px-1.5 py-0.5 text-[10px]">Ctrl S to save</kbd></footer>
-      </section>} />
+        {review.error && <p role="alert" className="mx-5 mt-3 max-h-28 overflow-y-auto rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-700 break-words">{review.error}</p>}
+        {transcriptionError && !transcriptOpen && <p role="alert" className="mx-5 mb-2 text-xs text-amber-800">Audio is saved. Transcription needs attention. <button type="button" className="underline underline-offset-2" onClick={() => setTranscriptOpen(true)}>View transcript</button></p>}
+        <div className={`xx-saved-note-body${transcriptOpen ? ' has-transcript' : ''}`}>
+          <div className="xx-saved-note-canvas"><textarea aria-label="Meeting notes" placeholder={'What would you like to remember?\n\nA thought, a decision, a next step…'} className="xx-saved-note-editor" disabled={!review.loaded} value={review.workspace.notes} onChange={event => review.updateNotes(event.target.value)} /></div>
+          <div id="saved-note-transcript" role="region" aria-label="Transcript" className="xx-saved-note-transcript" hidden={!transcriptOpen}>
+            <TranscriptWorkspacePanel compact playback={{ audio, path: audioPath, onError: setAudioError }} meeting={meeting} review={review} hasMore={hasMore} isLoadingMore={isLoadingMore} totalCount={totalCount} onLoadMore={onLoadMore} onDraftChange={setCorrectionDraft} />
+          </div>
+        </div>
+        <footer className="xx-saved-note-dock">
+          <div className="xx-saved-note-playback">
+            {audioPath ? <audio ref={audio} key={audioPath} aria-label="Meeting recording" controls preload="metadata" src={convertFileSrc(audioPath)} onError={() => setAudioError('The saved audio could not be played. Open its recording folder to inspect it.')} /> : <span>{recording ? 'Recording in progress' : 'No recording attached'}</span>}
+          </div>
+          <button type="button" className="xx-saved-note-transcript-toggle" aria-label={transcriptOpen ? 'Hide transcript' : 'Show transcript'} aria-expanded={transcriptOpen} aria-controls="saved-note-transcript" onClick={() => setTranscriptOpen(open => !open)} title={transcriptOpen ? 'Hide transcript' : 'Show transcript'}><Mic size={16} aria-hidden="true" /><span>{finishing ? 'Finishing transcript…' : 'Transcript'}</span>{transcriptOpen ? <ChevronDown size={16} aria-hidden="true" /> : <ChevronUp size={16} aria-hidden="true" />}</button>
+        </footer>
+        {audioError && <p role="alert" className="xx-saved-note-audio-error">{audioError}</p>}
+    </section>
     <Dialog open={pendingNavigation !== null} onOpenChange={open => { if (!open) setPendingNavigation(null); }}><DialogContent className="rounded-2xl border-[var(--xx-border)] bg-[var(--xx-paper)] text-[var(--xx-ink)] max-w-sm"><DialogHeader><DialogTitle>Keep your changes?</DialogTitle><DialogDescription className="text-[var(--xx-muted)]">This meeting has unsaved notes or corrections. Stay here to save them before leaving.</DialogDescription></DialogHeader><DialogFooter className="gap-2"><button className="xx-button-secondary text-sm" onClick={() => {
       const next = pendingNavigation; setPendingNavigation(null);
       if (!next) return;

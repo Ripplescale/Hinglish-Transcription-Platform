@@ -4,18 +4,20 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
-import { FileText, Home, Search, Plus, Settings, PanelLeftClose, PanelLeftOpen, MoreHorizontal, Pencil, Trash2, HardDrive, Info, X, AudioLines } from 'lucide-react';
+import { FileText, Home, Search, Plus, Settings, PanelLeftClose, PanelLeftOpen, MoreHorizontal, Pencil, Trash2, HardDrive, Info, X, AudioLines, Folder } from 'lucide-react';
 import { useSidebar, type CurrentMeeting } from './SidebarProvider';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { Dialog, DialogContent, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import Logo from '../Logo';
 import { About } from '../About';
+import { useProjectLibrary, projectLabel } from '@/hooks/useProjectLibrary';
 
 export default function Sidebar() {
   const router = useRouter();
   const pathname = usePathname();
-  const { currentMeeting, setCurrentMeeting, isCollapsed, toggleCollapse, searchTranscripts, searchResults, isSearching, meetings, setMeetings, transcriptGroups } = useSidebar();
+  const { currentMeeting, setCurrentMeeting, isCollapsed, toggleCollapse, searchTranscripts, searchResults, isSearching, meetings, setMeetings, transcriptGroups, handleRecordingToggle } = useSidebar();
+  const { projects } = useProjectLibrary();
   const activeMeetingId = transcriptGroups[currentMeeting?.id ?? ''] ?? currentMeeting?.id;
   const { isRecording } = useRecordingState();
   const [query, setQuery] = useState('');
@@ -80,6 +82,7 @@ export default function Sidebar() {
     try {
       await invoke('api_delete_meeting', { meetingId: remove.id });
       setMeetings(meetings.filter(meeting => meeting.id !== remove.id));
+      window.dispatchEvent(new Event('xx-projects-updated'));
       if (activeMeetingId === remove.id) { setCurrentMeeting(null); router.push('/'); }
       setRemove(null);
       toast.success('Conversation removed');
@@ -97,15 +100,23 @@ export default function Sidebar() {
       </div>
       <nav className="w-full space-y-1" aria-label="Main">
         <button className="xx-nav-button" aria-current={pathname === '/' ? 'page' : undefined} onClick={() => navigate('/')} title="Home"><Home />{!isCollapsed && 'Home'}</button>
-        <button className={`xx-nav-button ${isRecording ? 'text-rose-800' : ''}`} onClick={() => navigate('/')} title={isRecording ? 'Return to recording' : 'New recording'} aria-label={isRecording ? 'Return to recording' : 'New recording'}>
-          {isRecording ? <AudioLines /> : <Plus />}{!isCollapsed && (isRecording ? 'Recording in progress' : 'New recording')}
+        <button className={`xx-nav-button ${isRecording ? 'text-rose-800' : ''}`} onClick={() => {
+          if (isRecording) { navigate('/'); return; }
+          if (window.dispatchEvent(new CustomEvent('xx-before-navigate', { cancelable: true, detail: { href: '/' } }))) handleRecordingToggle();
+        }} title={isRecording ? 'Return to recording' : 'New note · starts recording'} aria-label={isRecording ? 'Return to recording' : 'New note'}>
+          {isRecording ? <AudioLines /> : <Plus />}{!isCollapsed && (isRecording ? 'Recording in progress' : 'New note')}
         </button>
       </nav>
       {!isCollapsed && <>
         <div className="xx-search"><Search size={14} className="shrink-0" /><input ref={searchInput} value={query} onChange={event => setQuery(event.target.value)} placeholder="Find a conversation" aria-label="Search conversations" />{query ? <button className="shrink-0" onClick={() => setQuery('')} aria-label="Clear search"><X size={13} /></button> : <kbd className="xx-key">Ctrl K</kbd>}</div>
-        <div className="flex items-center justify-between px-3 pt-7 pb-3"><span className="xx-eyebrow">Your conversations</span><span className="text-[10px] text-[var(--xx-muted)]">{filtered.length}</span></div>
+        {!query && projects.length > 0 && <div className="xx-sidebar-projects"><span className="xx-eyebrow">Projects</span>{projects.map(project => <button className="xx-nav-button" key={project.id} onClick={() => {
+          if (!window.dispatchEvent(new CustomEvent('xx-before-navigate', { cancelable: true, detail: { href: '/' } }))) return;
+          if (pathname === '/') window.dispatchEvent(new CustomEvent('xx-select-project', { detail: project.id }));
+          else { sessionStorage.setItem('xx.open-project', project.id); router.push('/'); }
+        }}><Folder size={14} /><span className="truncate">{projectLabel(project.name)}</span></button>)}</div>}
+        <div className="flex items-center justify-between px-3 pt-5 pb-3"><span className="xx-eyebrow">{query ? 'Search results' : 'Recent notes'}</span><span className="text-[10px] text-[var(--xx-muted)]">{filtered.length}</span></div>
         <div className="min-h-0 flex-1 overflow-y-auto custom-scrollbar" aria-label="Conversations">
-          {filtered.map(meeting => <div key={meeting.id} className={`xx-meeting-row ${pathname === '/meeting-details' && activeMeetingId === meeting.id ? 'is-current' : ''}`}>
+          {(query ? filtered : filtered.slice(0, 12)).map(meeting => <div key={meeting.id} className={`xx-meeting-row ${pathname === '/meeting-details' && activeMeetingId === meeting.id ? 'is-current' : ''}`}>
             <button onClick={() => navigate(`/meeting-details?id=${encodeURIComponent(meeting.id)}`, meeting)} title={meeting.title} aria-current={pathname === '/meeting-details' && activeMeetingId === meeting.id ? 'page' : undefined}>
               <FileText size={15} className="mt-0.5 shrink-0 text-[var(--xx-muted)]" /><span className="text-[13px] leading-5 line-clamp-2 break-words">{meeting.title}</span>
             </button>

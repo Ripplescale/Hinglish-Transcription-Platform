@@ -80,7 +80,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const [currentMeeting, setCurrentMeeting] = useState<CurrentMeeting | null>({ id: 'intro-call', title: '+ New Call' });
   const [isCollapsed, setIsCollapsed] = useState(false);
   useEffect(() => {
-    try { setIsCollapsed(localStorage.getItem('xx.sidebar.collapsed') === 'true'); } catch { /* Preferences may be unavailable. */ }
+    try { const saved = localStorage.getItem('xx.sidebar.collapsed'); setIsCollapsed(saved === null ? window.innerWidth < 1050 : saved === 'true'); } catch { /* Preferences may be unavailable. */ }
   }, []);
   const [meetings, setMeetings] = useState<CurrentMeeting[]>([]);
   const [transcriptGroups, setTranscriptGroups] = useState<Record<string, string>>({});

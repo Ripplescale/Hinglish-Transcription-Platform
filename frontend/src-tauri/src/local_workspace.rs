@@ -100,7 +100,7 @@ pub struct Correction {
 }
 
 fn empty_workspace(id: &str) -> serde_json::Value {
-    serde_json::json!({"version":1,"meeting_id":id,"revision":0,"notes":"","corrections":[],"project_id":"tapf","profile":null})
+    serde_json::json!({"version":1,"meeting_id":id,"revision":0,"notes":"","corrections":[],"project_id":null,"profile":null})
 }
 
 fn with_job_metadata(dir: &Path, mut value: serde_json::Value) -> Result<serde_json::Value,String> {
@@ -168,6 +168,53 @@ pub async fn save_transcript_workspace(
     value["profile"] = serde_json::to_value(profile).map_err(|e|e.to_string())?;
     let saved=append_revision(&dir, expected_revision, value)?;
     with_job_metadata(&dir,saved)
+}
+
+/// Autosaving a note must never replace transcript corrections or speaker names
+/// with a stale copy held by a notes-only editor.
+fn save_meeting_note_at(root: &Path, meeting_id: &str, expected_revision: u64,
+    notes: String, project_id: Option<String>, legacy: Option<(Option<String>, Option<String>)>,
+) -> Result<serde_json::Value, String> {
+    valid_id(meeting_id)?;
+    if notes.len() > 2_000_000 { return Err("Note is too large".into()); }
+    if let Some(id) = &project_id {
+        if latest_revision(&object_dir(root, "vaults", id)?)?.is_none() {
+            return Err("Project no longer exists. Choose a project before saving.".into());
+        }
+    }
+    let dir = object_dir(root, "workspaces", meeting_id)?;
+    let current = latest_revision(&dir)?;
+    let mut value = current.clone().unwrap_or_else(|| empty_workspace(meeting_id));
+    if current.is_none() {
+        if let Some((markdown, structured)) = legacy {
+            value["notes"] = markdown.unwrap_or_default().into();
+            value["legacy_notes_json"] = serde_json::to_value(structured).map_err(|e|e.to_string())?;
+        }
+    }
+    if value["revision"].as_u64().unwrap_or(0) != expected_revision {
+        return Err("This workspace changed in another window. Reload before saving.".into());
+    }
+    let project = serde_json::to_value(project_id).map_err(|e|e.to_string())?;
+    if current.is_some() && value["notes"] == notes && value["project_id"] == project {
+        return with_job_metadata(&dir, value);
+    }
+    value["notes"] = notes.into();
+    value["project_id"] = project;
+    with_job_metadata(&dir, append_revision(&dir, expected_revision, value)?)
+}
+
+#[tauri::command]
+pub async fn save_meeting_note(state: tauri::State<'_, AppState>, meeting_id: String,
+    expected_revision: u64, notes: String, project_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    valid_id(&meeting_id)?;
+    let exists: i64 = sqlx::query_scalar("SELECT count(*) FROM meetings WHERE id = ?")
+        .bind(&meeting_id).fetch_one(state.db_manager.pool()).await.map_err(|e|e.to_string())?;
+    if exists == 0 { return Err("Conversation no longer exists. Your draft was not saved.".into()); }
+    let legacy: Option<(Option<String>, Option<String>)> = sqlx::query_as("SELECT notes_markdown, notes_json FROM meeting_notes WHERE meeting_id = ?")
+        .bind(&meeting_id).fetch_optional(state.db_manager.pool()).await.map_err(|e|e.to_string())?;
+    let _guard = STORE_LOCK.lock().map_err(|e| e.to_string())?;
+    save_meeting_note_at(&data_root()?, &meeting_id, expected_revision, notes, project_id, legacy)
 }
 
 pub fn set_speaker_metadata(id: &str, job: &str, result: &serde_json::Value) -> Result<(),String> {
@@ -286,6 +333,75 @@ pub fn save_project_vault(project_id: String, expected_revision: u64, name: Stri
         serde_json::json!({"version":1,"id":project_id,"name":name,"entries":entries,"relationships":relationships}))
 }
 
+fn project_summary(vault: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"id":vault["id"],"name":vault["name"],"revision":vault["revision"],
+        "entry_count":vault["entries"].as_array().map(|entries|entries.len()).unwrap_or(0)})
+}
+
+fn validate_project_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 200 || name.chars().any(char::is_control) {
+        return Err("Choose a project name between 1 and 200 bytes without control characters".into());
+    }
+    Ok(name.to_owned())
+}
+
+fn create_project_at(root: &Path, name: &str) -> Result<serde_json::Value, String> {
+    let name = validate_project_name(name)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let value = append_revision(&object_dir(root, "vaults", &id)?, 0,
+        serde_json::json!({"version":1,"id":id,"name":name,"entries":[],"relationships":[]}))?;
+    Ok(project_summary(&value))
+}
+
+fn rename_project_at(root: &Path, project_id: &str, expected_revision: u64, name: &str) -> Result<serde_json::Value, String> {
+    let name = validate_project_name(name)?;
+    let dir = object_dir(root, "vaults", project_id)?;
+    let mut value = latest_revision(&dir)?.ok_or("Project no longer exists")?;
+    value["name"] = name.into();
+    Ok(project_summary(&append_revision(&dir, expected_revision, value)?))
+}
+
+#[tauri::command]
+pub fn create_project(name: String) -> Result<serde_json::Value, String> {
+    let _guard = STORE_LOCK.lock().map_err(|e| e.to_string())?;
+    create_project_at(&data_root()?, &name)
+}
+
+#[tauri::command]
+pub fn rename_project(project_id: String, expected_revision: u64, name: String) -> Result<serde_json::Value, String> {
+    let _guard = STORE_LOCK.lock().map_err(|e| e.to_string())?;
+    rename_project_at(&data_root()?, &project_id, expected_revision, &name)
+}
+
+fn library_meeting(root: &Path, id: String, title: String, created_at: String, legacy_notes: Option<String>) -> Result<serde_json::Value, String> {
+    // Only materialized assignments count. Loading a legacy/default workspace
+    // must not silently file unrelated recordings under the initial vault.
+    let workspace = latest_revision(&object_dir(root, "workspaces", &id)?)?;
+    let notes = workspace.as_ref().and_then(|value|value["notes"].as_str())
+        .or(legacy_notes.as_deref()).unwrap_or("");
+    let preview = notes.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(180).collect::<String>();
+    Ok(serde_json::json!({"id":id,"title":title,"created_at":created_at,
+        "project_id":workspace.as_ref().map(|value|value["project_id"].clone()).unwrap_or(serde_json::Value::Null),
+        "notes_preview":preview}))
+}
+
+#[tauri::command]
+pub async fn list_project_library(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT m.id,m.title,m.created_at,n.notes_markdown FROM meetings m LEFT JOIN meeting_notes n ON n.meeting_id=m.id ORDER BY m.created_at DESC,m.id")
+        .fetch_all(state.db_manager.pool()).await.map_err(|e|e.to_string())?;
+    let grouped = crate::local_transcription::get_local_transcript_groups(state).await?;
+    let hidden: HashSet<String> = grouped.iter().filter_map(|group|group["meeting_id"].as_str().map(str::to_owned)).collect();
+    let projects = list_project_vaults()?.iter().map(project_summary).collect::<Vec<_>>();
+    let _guard = STORE_LOCK.lock().map_err(|e| e.to_string())?;
+    let root = data_root()?;
+    let meetings = rows.into_iter().filter(|(id,_,_,_)|!hidden.contains(id))
+        .map(|(id,title,created_at,legacy)|library_meeting(&root,id,title,created_at,legacy))
+        .collect::<Result<Vec<_>,_>>()?;
+    Ok(serde_json::json!({"projects":projects,"meetings":meetings}))
+}
+
 #[tauri::command]
 pub async fn local_get_meeting_audio(app: tauri::AppHandle, state: tauri::State<'_, AppState>, meeting_id: String) -> Result<serde_json::Value, String> {
     let folder: Option<Option<String>> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
@@ -334,5 +450,88 @@ mod tests {
         assert!(validate_vault(&[entry.clone()], &[]).is_ok());
         entry.valid_from="2026-10-01".into(); entry.valid_to="2026-09-01".into();
         assert!(validate_vault(&[entry], &[]).is_err());
+    }
+
+    #[test]
+    fn note_autosave_preserves_corrections_speaker_names_and_progress() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create_project_at(root.path(), "  Willow  ").unwrap();
+        let dir = root.path().join("workspaces").join("meeting-one");
+        let mut initial = empty_workspace("meeting-one");
+        initial["notes"] = "first note".into();
+        initial["corrections"] = serde_json::json!([{"segment_id":"s1","original_text":"बारिश","text":"बारिश है","updated_at":"earlier"}]);
+        initial["speaker_names"] = serde_json::json!({"speaker-one":"Maya"});
+        initial["profile"] = "trelis-20".into();
+        initial["future_field"] = "keep me".into();
+        let first = append_revision(&dir,0,initial).unwrap();
+        append_revision(&dir.join("job-metadata"),0,serde_json::json!({"source_job_id":"job-one","segment_metadata":{"s1":{"source_track":"system"}},"profile":"trelis-20"})).unwrap();
+        let saved = save_meeting_note_at(root.path(),"meeting-one",1,"new note".into(),project["id"].as_str().map(str::to_owned),None).unwrap();
+        assert_eq!(saved["revision"],2);
+        assert_eq!(saved["corrections"],first["corrections"]);
+        assert_eq!(saved["speaker_names"],first["speaker_names"]);
+        assert_eq!(saved["future_field"],"keep me");
+        assert_eq!(saved["source_job_id"],"job-one");
+        assert_eq!(saved["segment_metadata"]["s1"]["source_track"],"system");
+        assert_eq!(saved["project_id"],project["id"]);
+        assert_eq!(latest_revision(&dir).unwrap().unwrap()["profile"],"trelis-20");
+        assert!(save_meeting_note_at(root.path(),"meeting-one",1,"stale note".into(),None,None).is_err());
+        assert_eq!(latest_revision(&dir).unwrap().unwrap()["notes"],"new note");
+        let unchanged = save_meeting_note_at(root.path(),"meeting-one",2,"new note".into(),project["id"].as_str().map(str::to_owned),None).unwrap();
+        assert_eq!(unchanged["revision"],2);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&fs::read(dir.join("revision-000000000001.json")).unwrap()).unwrap(),first);
+    }
+
+    #[test]
+    fn note_autosave_rejects_missing_projects_and_keeps_legacy_structure() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(save_meeting_note_at(root.path(),"meeting-one",0,"draft".into(),Some("missing".into()),None).is_err());
+        assert!(!root.path().join("workspaces").exists());
+        assert!(save_meeting_note_at(root.path(),"meeting-one",0,"draft".into(),Some("../other".into()),None).is_err());
+        let saved = save_meeting_note_at(root.path(),"meeting-one",0,"draft".into(),None,
+            Some((Some("legacy".into()),Some("{\"original\":true}".into())))).unwrap();
+        assert_eq!(saved["legacy_notes_json"],"{\"original\":true}");
+        assert_eq!(saved["notes"],"draft");
+        assert!(saved["project_id"].is_null());
+    }
+
+    #[test]
+    fn project_rename_preserves_evidence_and_rejects_stale_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create_project_at(root.path(),"  Willow  ").unwrap();
+        assert_eq!(project["name"],"Willow");
+        let id = project["id"].as_str().unwrap();
+        let dir = root.path().join("vaults").join(id);
+        let mut value = latest_revision(&dir).unwrap().unwrap();
+        value["entries"] = serde_json::json!([{"id":"ref-one","canonical":"Willow","source":"checked note"}]);
+        value["relationships"] = serde_json::json!([{"source":"meeting-one"}]);
+        let prior = append_revision(&dir,1,value).unwrap();
+        let renamed = rename_project_at(root.path(),id,2,"Willow research").unwrap();
+        assert_eq!(renamed["entry_count"],1);
+        assert_eq!(renamed["revision"],3);
+        let after = latest_revision(&dir).unwrap().unwrap();
+        assert_eq!(after["entries"],prior["entries"]);
+        assert_eq!(after["relationships"],prior["relationships"]);
+        assert!(rename_project_at(root.path(),id,2,"stale rename").is_err());
+        assert!(create_project_at(root.path()," \n ").is_err());
+        assert!(rename_project_at(root.path(),"../escape",0,"bad").is_err());
+        assert_eq!(latest_revision(&dir).unwrap().unwrap()["name"],"Willow research");
+    }
+
+    #[test]
+    fn library_uses_only_saved_project_assignments_and_unicode_safe_previews() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = library_meeting(root.path(),"meeting-one".into(),"Old call".into(),"2026-10-01".into(),Some("मेरी\n पुरानी notes".into())).unwrap();
+        assert!(legacy["project_id"].is_null());
+        assert_eq!(legacy["notes_preview"],"मेरी पुरानी notes");
+        assert!(!root.path().join("workspaces").exists());
+        let dir = root.path().join("workspaces").join("meeting-two");
+        let mut saved = empty_workspace("meeting-two");
+        saved["project_id"] = "prior-project".into();
+        saved["notes"] = "न".repeat(250).into();
+        append_revision(&dir,0,saved).unwrap();
+        let row = library_meeting(root.path(),"meeting-two".into(),"Saved call".into(),"2026-10-02".into(),Some("old fallback".into())).unwrap();
+        assert_eq!(row["project_id"],"prior-project");
+        assert_eq!(row["notes_preview"].as_str().unwrap().chars().count(),180);
+        assert!(empty_workspace("new")["project_id"].is_null());
     }
 }

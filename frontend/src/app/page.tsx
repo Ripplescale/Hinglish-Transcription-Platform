@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { RecordingControls } from '@/components/RecordingControls';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { usePermissionCheck } from '@/hooks/usePermissionCheck';
@@ -23,13 +23,26 @@ import { useRouter } from 'next/navigation';
 import { LocalTranscriptionPanel } from '@/components/LocalTranscriptionPanel';
 import { CaptureRecoveryPanel } from '@/components/CaptureRecoveryPanel';
 import { LiveTranscriptPanel } from '@/components/LiveTranscriptPanel';
-import { FileText, SlidersHorizontal, ArrowUpRight, Headphones } from 'lucide-react';
+import { ChevronUp, ChevronDown, ArrowLeft, SlidersHorizontal, Mic } from 'lucide-react';
+import { NoteLibrary } from '@/components/NoteLibrary';
+import { LiveNoteEditor } from '@/components/LiveNoteEditor';
+import { useLocalWorkflow } from '@/contexts/LocalWorkflowContext';
+import { invoke } from '@tauri-apps/api/core';
 
 export default function Home() {
   // Local page state (not moved to contexts)
   const [isRecording, setIsRecordingState] = useState(false);
   const barHeights = ['10px', '18px', '12px'];
   const [showRecoveryDialog, setShowRecoveryDialog] = useState(false);
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [transcriptOpen, setTranscriptOpen] = useState(false);
+  const [initialProject, setInitialProject] = useState<string | null | undefined>(undefined);
+  const [noteSession, setNoteSession] = useState<string | null>(null);
+  const [noteTitle, setNoteTitle] = useState('Untitled note');
+  const titleDirty = useRef(false);
+  const titleGeneration = useRef(0);
+  const [startError, setStartError] = useState<string | null>(null);
+  const { state: workflowState } = useLocalWorkflow();
 
   // Use contexts for state management
   const { meetingTitle } = useTranscripts();
@@ -64,6 +77,36 @@ export default function Home() {
   } = useTranscriptRecovery();
 
   const router = useRouter();
+  const run = workflowState.runs.find(item => item.primary && item.capture.session_id === workflowState.currentSession && (item.recording || item.capture.session_id === noteSession));
+  const titleMeeting = useRef<string | undefined>(undefined);
+  titleMeeting.current = run?.meetingId;
+  useEffect(() => {
+    const saved = meetings.find(meeting => meeting.id === run?.meetingId);
+    if (saved && !titleDirty.current) setNoteTitle(saved.title);
+  }, [run?.meetingId, meetings]);
+  useEffect(() => {
+    if (recordingState.isRecording) {
+      setNoteOpen(true);
+      if (workflowState.currentSession) setNoteSession(workflowState.currentSession);
+    }
+  }, [recordingState.isRecording, workflowState.currentSession]);
+  const newNote = async (projectId: string | null) => {
+    if (recordingState.isRecording || recordingState.isStartingRecording) { setNoteOpen(true); return; }
+    titleDirty.current = false; titleGeneration.current += 1;
+    setNoteOpen(true); setTranscriptOpen(false); setInitialProject(projectId); setNoteSession(null); setNoteTitle('Untitled note'); setStartError(null);
+    try { await handleRecordingStart(); }
+    catch (reason) { setStartError(`Recording could not start. Check your microphone and recording settings, then try again. ${String(reason)}`); }
+  };
+  const renameNote = async () => {
+    if (!run?.meetingId || !titleDirty.current || !noteTitle.trim()) return;
+    const meetingId = run.meetingId;
+    const generation = titleGeneration.current;
+    try {
+      await invoke('api_save_meeting_title', { meetingId, title: noteTitle.trim() });
+      if (titleMeeting.current === meetingId && titleGeneration.current === generation) titleDirty.current = false;
+      await refetchMeetings(); window.dispatchEvent(new Event('xx-projects-updated'));
+    } catch (reason) { toast.error('Title could not be saved', { description: String(reason) }); }
+  };
 
   useEffect(() => {
     // Track page view
@@ -177,30 +220,26 @@ export default function Home() {
   const isProcessingStop = status === RecordingStatus.PROCESSING_TRANSCRIPTS || isProcessing;
 
   return (
-    <div className="xx-home">
-      <header className="flex shrink-0 items-center justify-between gap-4">
-        <div><p className="xx-eyebrow">A little room for every conversation</p><h1 className="xx-heading text-[28px] mt-1">Your listening space</h1></div>
-        <span className="flex items-center gap-2 text-xs text-[var(--xx-muted)]"><Headphones size={14} />Headphones recommended</span>
-      </header>
-      <CaptureRecoveryPanel />
+    <div className="xx-home xx-notes-home">
       <SettingsModals modals={modals} messages={messages} onClose={hideModal} />
       <TranscriptRecovery isOpen={showRecoveryDialog} onClose={handleDialogClose} recoverableMeetings={recoverableMeetings} onRecover={handleRecovery} onDelete={deleteRecoverableMeeting} onLoadPreview={loadMeetingTranscripts} />
-      <div className="xx-home-sheet xx-paper">
-        <details className="xx-recording-options shrink-0 border-b border-[var(--xx-border)]">
-          <summary className="flex cursor-pointer items-center gap-2 px-6 py-3 text-xs text-[var(--xx-muted)]"><SlidersHorizontal size={14} />Recording options<span className="ml-auto">Trelis live · Apex fallback</span></summary>
-          <div className="max-h-[38vh] overflow-y-auto px-5 pb-4"><LocalTranscriptionPanel /></div>
-        </details>
-        <LiveTranscriptPanel />
-        {(hasMicrophone || isRecording) && status !== RecordingStatus.PROCESSING_TRANSCRIPTS && status !== RecordingStatus.SAVING && <div className="xx-recording-dock">
+      {!noteOpen && !recordingState.isRecording ? <NoteLibrary onNewNote={projectId => void newNote(projectId)} busy={recordingState.isStartingRecording || isStopping || isSaving} recovery={<CaptureRecoveryPanel />} /> : <div className="xx-compose">
+        <header className="xx-compose-header"><div className="xx-compose-crumb"><button className="xx-icon-button" aria-label="Back to notes" disabled={recordingState.isRecording || recordingState.isStartingRecording} title={recordingState.isRecording ? 'Stop recording to return to your notes' : 'Back to notes'} onClick={() => {
+          const onProceed = () => setNoteOpen(false);
+          if (window.dispatchEvent(new CustomEvent('xx-before-navigate', { cancelable: true, detail: { href: '/', onProceed } }))) onProceed();
+        }}><ArrowLeft size={17} /></button><span>{new Date().toLocaleDateString(undefined, { month: 'long', day: 'numeric' })}</span></div><input className="xx-note-title" aria-label="Note title" value={noteTitle} disabled={!run?.meetingId} maxLength={200} onChange={event => { titleDirty.current = true; titleGeneration.current += 1; setNoteTitle(event.target.value); }} onBlur={() => void renameNote()} placeholder="Untitled note" /></header>
+        {startError && <p role="alert" className="xx-inline-error">{startError}</p>}
+        {(run?.error || run?.job?.error) && <div role="alert" className="xx-inline-error">Audio is still being saved. Transcription needs attention; open Recording options to retry or use Apex fallback.</div>}
+        {run?.meetingId ? <LiveNoteEditor key={run.meetingId} meetingId={run.meetingId} initialProject={initialProject} /> : <div className="xx-opening-note"><p>{recordingState.isStartingRecording ? 'Opening your note…' : 'Your note opens when recording starts.'}</p>{startError && <button className="xx-button-secondary" onClick={() => void newNote(initialProject ?? null)}>Try recording again</button>}</div>}
+        <div className="xx-transcript-drawer" id="live-transcript-drawer" hidden={!transcriptOpen}><div className="xx-drawer-label"><span>Transcript</span><button className="xx-icon-button" aria-label="Hide transcript" onClick={() => setTranscriptOpen(false)}><ChevronDown size={16} /></button></div><LiveTranscriptPanel /></div>
+        {status !== RecordingStatus.PROCESSING_TRANSCRIPTS && status !== RecordingStatus.SAVING && <div className="xx-recording-dock xx-note-dock">
           <RecordingControls isRecording={recordingState.isRecording} onRecordingStop={(callApi = true) => handleRecordingStop(callApi)} onRecordingStart={handleRecordingStart} onTranscriptReceived={() => {}} onStopInitiated={() => setIsStopping(true)} barHeights={barHeights} onTranscriptionError={message => showModal('errorAlert', message)} isRecordingDisabled={isRecordingDisabled} isParentProcessing={isProcessingStop} selectedDevices={selectedDevices} meetingName={meetingTitle} />
-          <p className="max-w-[220px] text-xs leading-5 text-[var(--xx-muted)]">{isRecording ? 'Your audio is being saved on this laptop.' : 'Microphone + computer audio. You decide when to start.'}</p>
+          <button className="xx-transcript-toggle" aria-label={transcriptOpen ? 'Hide transcript' : 'Show transcript'} aria-controls="live-transcript-drawer" aria-expanded={transcriptOpen} onClick={() => setTranscriptOpen(!transcriptOpen)}><Mic size={15} />Transcript{transcriptOpen ? <ChevronDown size={15} /> : <ChevronUp size={15} />}</button>
+          <span className="xx-recording-status" title="Audio is saved while Trelis prepares the transcript. The first text can take about a minute.">{recordingState.isPaused ? 'Paused' : recordingState.isRecording ? run?.job?.segments?.length ? 'Listening' : 'Listening · preparing transcript' : run?.meetingId ? 'Audio saved' : 'Not recording'}</span>
+          <details className="xx-recording-options xx-dock-options"><summary aria-label="Recording options" title="Recording options"><SlidersHorizontal size={16} /></summary><div><LocalTranscriptionPanel /></div></details>
         </div>}
         <StatusOverlays isProcessing={status === RecordingStatus.PROCESSING_TRANSCRIPTS && !recordingState.isRecording} isSaving={status === RecordingStatus.SAVING} sidebarCollapsed={sidebarCollapsed} />
-      </div>
-      {!isRecording && meetings.length > 0 && <section className="shrink-0" aria-label="Recent conversations">
-        <div className="xx-eyebrow mb-2">Pick up where you left off</div>
-        <div className="grid grid-cols-3 gap-3">{meetings.slice(0, 3).map(meeting => <button key={meeting.id} className="xx-recent-meeting" onClick={() => { setCurrentMeeting(meeting); router.push(`/meeting-details?id=${encodeURIComponent(meeting.id)}`); }}><FileText size={15} className="shrink-0 text-[var(--xx-muted)]" /><span className="truncate">{meeting.title}</span><ArrowUpRight size={13} className="ml-auto shrink-0 text-[var(--xx-muted)]" /></button>)}</div>
-      </section>}
+      </div>}
     </div>
   );
 }

@@ -4,9 +4,9 @@ xx keeps audio as the source of truth and treats transcripts as editable interpr
 
 ## From recording to transcript
 
-1. **Choose devices and record.** Microphone and system audio are written independently, with a session manifest and timing journal. Capture does not depend on a model loading successfully.
+1. **Open a new note.** Choose a project on the home screen, then click New note. This action starts microphone and system-audio capture and opens the writing canvas. Tracks are written independently with a session manifest and timing journal. Capture does not depend on a model loading successfully. Recording options remain available in the bottom bar.
 2. **Save before inference.** The worker builds bounded mono windows from saved audio on the session clock. Gaps and interruptions remain visible. Original tracks stay available for recovery.
-3. **Follow the live transcript.** Trelis processes saved 20-second windows during the call using OpenVINO GPU FP16. It preserves the original Hindi/English script, and its raw output is retained as it arrives.
+3. **Write while xx listens.** Notes autosave independently. Open the transcript with the microphone/up-arrow control when you want to check it. Trelis processes saved 20-second windows during the call using OpenVINO GPU FP16. It preserves the original Hindi/English script, and its raw output is retained as it arrives.
 4. **Stop and finish remaining audio.** Stopping capture lets the same Trelis job drain its backlog and process the final partial window. The display changes from Live transcript to Finishing transcript, then Final transcript on completion. There is no second full pass. “Final” means processing finished, not human verification.
 5. **Flag suspicious output.** Quiet input, gaps, repetition, or substantial audio with sparse text can trigger flags and bounded retries. Original results and alternatives remain available. A longer retry is not proof of better recognition.
 6. **Review speakers.** Optional Community-1 runs after recording and transcription complete. Turns are mapped to transcript windows, overlapping candidates remain explicit, and manual names survive reconciliation. Live individual speaker identification remains future work.
@@ -71,7 +71,19 @@ Each ASR job keeps its model/configuration identity and original output. The Tre
 
 The optional project Vault stores verified terms, names, quantities, relationships, and sources. Quantity entries require context and units. It does not currently fine-tune models, train on calls, or automatically replace words in a transcript.
 
+The home library uses saved project assignments, with unassigned meetings shown as Unfiled. Creating or renaming a project preserves its reference history. Project memory shows excerpts from the user's notes and the project's references. Notes link to their source recordings; references retain source attribution. It is an evidence shelf, not AI synthesis or an automatically inferred knowledge graph.
+
+Live notes use serialized notes-only saves; corrections, model progress and speaker metadata remain separate. Drafts are also journaled in the local WebView while a save is pending. New edits made during a save are retained and saved next. A conflicting edit from another window stops automatic saving and retains the draft; Retry does not overwrite the newer notes. Saved-note editing also autosaves, while incomplete transcript correction drafts wait for Apply correction. Navigation guards protect pending edits.
+
 There is no automatic summary stage. Copy-and-open Claude and TXT/Cowork handoff prepare content; they do not call a summary API or send a message automatically.
+
+## Meeting preparation
+
+Outlook calendar access and automatic recaps are not implemented in this release. Calendar access must be approved by the account's administrator where required; another account-access route must not be used to work around an explicit restriction.
+
+The proposed integration reads a bounded upcoming calendar window using delegated Microsoft Graph `Calendars.ReadBasic`, then binds a selected event and attendee snapshot to a note. Match earlier notes by recurring series first, then normalized attendee identities within the project. Partial attendee overlaps should be suggestions, not silent merges. The calendar identifies who and when; it does not establish what was discussed. Earlier notes without an event/attendee association need an initial explicit link.
+
+A first meeting-preparation view can show the latest linked notes and transcript excerpts with sources. A generated recap requires a separately chosen summarization step; the current Claude handoff remains user-controlled. See Microsoft's [calendar view API](https://learn.microsoft.com/en-us/graph/api/calendar-list-calendarview?view=graph-rest-1.0) and [calendar permissions](https://learn.microsoft.com/en-us/graph/permissions-reference#calendarsreadbasic).
 
 ## Storage
 

@@ -13,7 +13,7 @@ const MainContent: React.FC<MainContentProps> = ({ children }) => {
   return (
     <main
       className="xx-main flex-1 min-w-0 h-screen overflow-hidden"
-      style={{ marginLeft: isCollapsed ? 72 : 248 }}
+      style={{ marginLeft: isCollapsed ? 64 : 208 }}
     >
       <div className="h-full min-h-0 min-w-0 w-full max-w-full overflow-hidden">
         {children}

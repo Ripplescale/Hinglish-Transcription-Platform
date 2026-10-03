@@ -566,6 +566,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             local_workspace::load_transcript_workspace,
             local_workspace::save_transcript_workspace,
+            local_workspace::save_meeting_note,
+            local_workspace::list_project_library,
+            local_workspace::create_project,
+            local_workspace::rename_project,
             local_workspace::local_get_meeting_audio,
             local_workspace::list_project_vaults,
             local_workspace::load_project_vault,
