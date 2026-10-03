@@ -1,0 +1,6 @@
+:root { font-family: "Segoe UI", sans-serif; color: #392c31; background: #fff7f8; color-scheme: light; }
+* { box-sizing: border-box; } body { margin: 0; } main { padding: 20px; }
+.eyebrow { font-size: 10px; letter-spacing: 1.5px; color: #80636d; } h1 { font-size: 21px; margin: 12px 0 8px; font-weight: 600; }
+p { font-size: 13px; line-height: 1.5; margin: 0; color: #725c64; } .actions { display: flex; gap: 9px; margin: 18px 0 12px; }
+button { border: 1px solid #dfcbd1; border-radius: 8px; padding: 9px 15px; font: 600 13px "Segoe UI",sans-serif; background: #fff; color: #513b44; cursor: pointer; }
+#record { background: #7c3f56; border-color: #7c3f56; color: white; } button:focus-visible { outline: 3px solid #bd7893; outline-offset: 2px; } button:disabled { opacity: .55; cursor: default; } #status { font-size: 11px; }

@@ -11,6 +11,7 @@
         "beforeBuildCommand": "pnpm build"
     },
     "app": {
+        "withGlobalTauri": true,
         "windows": [
             {
                 "title": "xx",
@@ -43,6 +44,12 @@
                 ]
             },
             "capabilities": [
+                {
+                    "identifier": "meeting-prompt",
+                    "description": "Local call prompt; custom commands validate its window label",
+                    "windows": ["meeting-prompt"],
+                    "permissions": []
+                },
                 {
                     "identifier": "main",
                     "description": "Main window capability with file system and media access",

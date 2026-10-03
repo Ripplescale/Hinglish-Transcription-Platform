@@ -1,0 +1,18 @@
+[package]
+name = "meeting-detection-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.32"
+tauri = { version = "2.6.2", features = ["tray-icon"] }
+windows = { version = "0.61", features = ["Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant"] }
+
+[[bin]]
+name = "probe"
+path = "src/probe.rs"

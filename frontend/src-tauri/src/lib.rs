@@ -54,6 +54,7 @@ pub mod parakeet_engine;
 pub mod state;
 pub mod summary;
 pub mod tray;
+mod meeting_detection;
 pub mod utils;
 pub mod whisper_engine;
 #[cfg(target_os = "windows")]
@@ -495,6 +496,7 @@ pub fn run() {
             log::info!("Application setup complete");
 
             // Initialize system tray
+            meeting_detection::start(_app.handle());
             if let Err(e) = tray::create_tray(_app.handle()) {
                 log::error!("Failed to create system tray: {}", e);
             }
@@ -577,6 +579,12 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            meeting_detection::meeting_detection_status,
+            meeting_detection::set_meeting_detection,
+            meeting_detection::meeting_detection_ready,
+            meeting_detection::meeting_detection_take_request,
+            meeting_detection::meeting_prompt,
+            meeting_detection::respond_to_meeting,
             local_workspace::load_transcript_workspace,
             local_workspace::save_transcript_workspace,
             local_workspace::save_meeting_note,

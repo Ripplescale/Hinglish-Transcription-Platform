@@ -27,6 +27,7 @@ import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
 import { LocalWorkflowProvider } from '@/contexts/LocalWorkflowContext'
 import { LOCAL_TRANSCRIPT_ONLY } from '@/lib/local-workflow'
+import { MeetingDetectionBridge } from '@/components/MeetingDetectionBridge'
 
 
 // Use installed fonts so local builds and offline startup do not fetch Google Fonts.
@@ -235,6 +236,7 @@ export default function RootLayout({
                   <OnboardingProvider>
                     <UpdateCheckProvider>
                       <SidebarProvider>
+                        <MeetingDetectionBridge ready={onboardingCompleted && !showOnboarding} />
                         <TooltipProvider>
                           <LocalWorkflowProvider><RecordingPostProcessingProvider>
                             <ImportDialogProvider onOpen={handleOpenImportDialog}>

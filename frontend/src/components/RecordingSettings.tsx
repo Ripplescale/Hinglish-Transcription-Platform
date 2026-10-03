@@ -8,6 +8,7 @@ import { toast } from 'sonner';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { useConfig } from '@/contexts/ConfigContext';
 import { LOCAL_TRANSCRIPT_ONLY } from '@/lib/local-workflow';
+import { MeetingDetectionSettings } from '@/components/MeetingDetectionSettings';
 
 export interface RecordingPreferences {
   save_folder: string;
@@ -172,6 +173,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
       </div>
 
       {/* Auto Save Toggle */}
+      <MeetingDetectionSettings />
       {LOCAL_TRANSCRIPT_ONLY && <div className="rounded-lg border bg-white p-4 space-y-2"><h4 className="font-medium">Audio is always saved while recording</h4><p className="text-sm text-gray-600">Microphone and system audio are stored separately under %LOCALAPPDATA%\STTApp\recordings. A combined WAV is created when recording stops.</p><p className="text-xs text-gray-500">Transcription can pause or fail while the recorder continues saving audio.</p></div>}
       {!LOCAL_TRANSCRIPT_ONLY && <div className="flex items-center justify-between p-4 border rounded-lg">
         <div className="flex-1">
