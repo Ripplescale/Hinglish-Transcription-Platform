@@ -4,13 +4,13 @@ xx is currently a Windows x64 application with a separately prepared local model
 
 ## Using an existing installation
 
-Run the locally supplied xx setup program, then open **xx** from Start. Close the previous app normally before opening xx: the renamed installer can coexist with it, and both use the same workspace. Opening xx does not start recording.
+Close any running instance of xx normally before upgrading, then run the locally supplied xx setup program and open **xx** from Start. The upgrade retains the existing local workspace. Opening xx shows your notes without starting recording.
 
 The install includes the desktop application, FFmpeg, and required Microsoft C++ runtime files. It reuses the existing local models and Python environments. Its adjacent `sttapp-local-install.json` points to the data root; do not commit this machine-specific file.
 
 1. Check the local runtime status, microphone, and system-audio device.
 2. Choose the call language. New recordings use **Trelis · 20 seconds · OpenVINO GPU FP16** for the live transcript, preserving original Hindi/English script. Model loading adds startup time, and each update takes a 20-second window plus processing time.
-3. Record a short test. Stop and let the same job finish remaining audio; there is no second full pass. Check playback and the transcript before relying on a longer call.
+3. Select a project, then click **New note** at the top right. This immediately starts microphone and system-audio recording and opens a blank notes editor. Notes autosave; the **Transcript** control beside the recording controls reveals live text. For a short test, choose **Finish recording** and let the same job finish remaining audio; there is no second full pass. Check playback and the transcript before relying on a longer call.
 4. If Trelis needs attention, choose **Use Apex fallback**. The app pauses Trelis after its current window and imports its last output before Apex replays the saved audio as a separate version. GPU errors are shown, without a silent Trelis CPU fallback.
 5. Review the transcript and edit text or speakers where needed. “Final transcript” means processing completed, not that a person checked it. Copy/export into Claude only when you want to review and send it yourself.
 
@@ -33,7 +33,7 @@ $sttRoot = Join-Path $env:LOCALAPPDATA 'STTApp'
 $sttLab = Join-Path $sttRoot 'lab'
 ```
 
-The repository is private; cloning requires an authorized GitHub account. No private recordings or reference transcripts are required to install the worker.
+The repository is public. No private recordings or reference transcripts are required to install the worker.
 
 ## Download the two ASR models
 
