@@ -22,7 +22,7 @@ export function MeetingDetectionSettings() {
         <p className="text-sm text-gray-600">Show a small prompt when a desktop call uses your microphone. You choose when to record.</p></div>
       <Switch id="meeting-detection" checked={status.enabled} disabled={saving} onCheckedChange={change} />
     </div>
-    <p className="mt-2 text-xs text-gray-500">Keep xx running in the tray. Browser calls and calls that never activate the microphone may need a manual start.</p>
+    <p className="mt-2 text-xs text-gray-500">Keep oats running in the tray. Browser calls and calls that never activate the microphone may need a manual start.</p>
     {status.error && <p role="status" className="mt-2 text-xs text-red-700">Detection is unavailable. You can still start recording manually.</p>}
   </div>;
 }

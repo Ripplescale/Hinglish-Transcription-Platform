@@ -10,7 +10,7 @@ import { Button } from '@/components/ui/button';
 import { ArrowUpRight, ChevronDown, Download, FileText, Headphones, Pencil, Info } from 'lucide-react';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { useLocalWorkflow } from '@/contexts/LocalWorkflowContext';
-import { isTerminalJob, type WorkflowRole } from '@/lib/local-transcription-workflow';
+import { isTerminalJob, isTrelisProfile, profileLabel, type WorkflowRole } from '@/lib/local-transcription-workflow';
 import { useRouter } from 'next/navigation';
 
 type Review = ReturnType<typeof useTranscriptWorkspace>;
@@ -50,7 +50,7 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
   const audio = playback?.audio ?? internalAudio;
   const playablePath = playback ? playback.path : audioPath;
   const profileId = review.workspace.profile || activeLayer?.profile;
-  const transcriptProfile = profileId === 'apex-20' ? 'Apex · 20s' : profileId === 'trelis-20' ? 'Trelis · 20s' : null;
+  const transcriptProfile = profileLabel(profileId);
   const layerRefresh = state.runs.map(item => `${item.transcriptMeetingId}:${item.job?.job_id}:${item.job?.state}`).join('|');
   useEffect(() => {
     let cancelled = false;
@@ -75,7 +75,7 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
     }
     if (layer.workflow_role === 'live-draft') return 'Live draft';
     if (layer.workflow_role === 'final' || (layer.primary && layers.some(item => item.workflow_role === 'live-draft'))) return 'Final transcript';
-    return layer.profile === 'apex-20' ? 'Apex version' : layer.profile === 'trelis-20' ? 'Trelis version' : 'Original transcript';
+    return layer.profile === 'apex-20' ? 'Apex version' : isTrelisProfile(layer.profile) ? `${profileLabel(layer.profile)} version` : 'Original transcript';
   };
   useEffect(() => { onDraftChange?.(editing !== null); }, [editing, onDraftChange]);
   useEffect(() => { setEditing(null); }, [meeting.id]);
@@ -139,7 +139,7 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
   return <section className="flex h-full min-h-0 min-w-0 flex-col bg-[var(--xx-paper)] text-[var(--xx-ink)]" aria-label="Transcript review">
     <header className={`shrink-0 border-b border-[var(--xx-border)] px-5 ${compact ? 'pt-4 pb-3 space-y-2 max-h-[45%] overflow-y-auto' : 'pt-5 pb-4 space-y-3'}`}>
       <div className="xx-eyebrow flex items-center gap-2"><FileText size={13} aria-hidden="true" />{activeRole === 'fallback' ? 'Apex fallback' : activeRole === 'live-final' ? liveTitle : activeRole === 'live-draft' ? 'Live draft' : activeRole === 'final' ? 'Final transcript' : 'Transcript'}</div>
-      {!compact && <h1 className="text-[24px] leading-tight font-normal [font-family:Georgia,serif] break-words">{displayTitle}</h1>}
+      {!compact && <h1 className="xx-heading text-[24px] leading-tight break-words">{displayTitle}</h1>}
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-[11px] text-[var(--xx-muted)]">{transcriptProfile ? <span className="font-medium text-[var(--xx-accent)]">Transcript: {transcriptProfile}</span> : 'Original script'}<span className="mx-2">·</span>{totalCount ?? meeting.transcripts.length} segments</p>
         <DropdownMenu><DropdownMenuTrigger asChild><button type="button" className="xx-button-secondary !min-h-8 !px-3 text-xs" disabled={exporting || !review.loaded || editing !== null}><Download size={13} aria-hidden="true" />{exporting ? 'Preparing…' : 'Export'}<ChevronDown size={12} aria-hidden="true" /></button></DropdownMenuTrigger>
@@ -166,7 +166,7 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
       {(run?.error || run?.job?.error) && <p role="alert" className="text-xs text-amber-800">Audio is saved. Transcription needs attention — open Tools → Transcription &amp; versions.</p>}
     </header>
     <div className="min-h-0 flex-1 overflow-y-auto px-5 py-2 [scrollbar-gutter:stable]">
-      {!meeting.transcripts.length && <div className="py-12 text-center"><Headphones className="mx-auto mb-3 text-[var(--xx-accent)]" size={26} /><p className="text-sm text-[var(--xx-muted)]">{pendingFinal ? 'The final transcript is on its way.' : 'Your words will appear here.'}</p><p className="mt-2 text-xs leading-5 text-[var(--xx-muted)]">{pendingFinal ? 'Trelis processes the saved audio after the call. You can read the Apex live draft while you wait.' : activeRole === 'fallback' ? 'Apex replays the saved recording into this separate version.' : 'Audio is transcribed in 20-second windows plus processing time. Your original recording is retained.'}</p></div>}
+      {!meeting.transcripts.length && <div className="py-12 text-center"><Headphones className="mx-auto mb-3 text-[var(--xx-accent)]" size={26} /><p className="text-sm text-[var(--xx-muted)]">{pendingFinal ? 'The final transcript is on its way.' : 'Your words will appear here.'}</p><p className="mt-2 text-xs leading-5 text-[var(--xx-muted)]">{pendingFinal ? 'Trelis processes the saved audio after the call. You can read the Apex live draft while you wait.' : activeRole === 'fallback' ? 'Apex replays the saved recording into this separate version.' : 'Audio is transcribed in the selected chunks plus processing time. Your original recording is retained.'}</p></div>}
       {meeting.transcripts.map(segment => {
         const text = effectiveText(segment, review.workspace.corrections);
         const corrected = text !== segment.text;
@@ -190,7 +190,7 @@ export function TranscriptWorkspacePanel({ meeting, review, hasMore, isLoadingMo
           {corrected && <details className="text-xs text-gray-500"><summary className="cursor-pointer">Original recognition</summary><p className="whitespace-pre-wrap leading-6 mt-2">{segment.text}</p></details>}
           {stale && <p className="text-xs text-amber-700">A saved correction belongs to an earlier recognition result and was not applied.</p>}
           {!!speakers?.speaker_candidates.length && <p className="text-[11px] text-[var(--xx-muted)]" title="Estimated speakers heard in this audio window. Individual words are not assigned to a person.">Heard in this window: {speakers.speaker_candidates.map(id => review.workspace.speaker_names?.[id] || id).join(', ')}{speakers.has_overlap ? ' · overlapping speech' : ''}</p>}
-          {!!metadata?.quality_flags?.length && <details className="text-xs text-amber-800"><summary className="cursor-pointer">Processing checks</summary><p className="mt-2">{metadata.quality_flags.map(flag => flag.replaceAll('_', ' ')).join(' · ')}</p>{metadata.alternative?.text && <div className="mt-2 space-y-2"><p>A shorter-window retry is available for comparison. It has not replaced the original recognition.</p><p className="whitespace-pre-wrap leading-6">{metadata.alternative.text}</p></div>}</details>}
+          {!!metadata?.quality_flags?.length && <details className="text-xs text-amber-800"><summary className="cursor-pointer">Processing checks</summary><p className="mt-2">{metadata.quality_flags.map(flag => flag.replaceAll('_', ' ')).join(' · ')}</p>{metadata.alternative?.text && <div className="mt-2 space-y-2">{metadata.alternative.promoted ? <><p>A shorter-window retry was selected for this transcript. Review it against the recording.</p>{metadata.original_recognition_text != null ? <details><summary className="cursor-pointer">Recognition before shorter retry</summary><p className="mt-2 whitespace-pre-wrap leading-6">{metadata.original_recognition_text}</p></details> : <p>The recognition before retry is not available in this workspace.</p>}</> : <><p>A shorter-window retry is available for comparison. It has not replaced the original recognition.</p><p className="whitespace-pre-wrap leading-6">{metadata.alternative.text}</p></>}</div>}</details>}
         </article>;
       })}
       {hasMore && <Button variant="outline" className="w-full" disabled={isLoadingMore} onClick={onLoadMore}>{isLoadingMore ? 'Loading…' : 'Load more transcript'}</Button>}

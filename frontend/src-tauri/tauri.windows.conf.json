@@ -1,5 +1,13 @@
 {
   "bundle": {
+    "windows": {
+      "nsis": {
+        "template": "scripts/installer-oats.nsi",
+        "installerHooks": "scripts/oats-installer-hooks.nsh",
+        "installerIcon": "icons/app_icon.ico",
+        "uninstallerIcon": "icons/app_icon.ico"
+      }
+    },
     "resources": {
       "templates": "templates",
       "binaries/onnxruntime": ".",

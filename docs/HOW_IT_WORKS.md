@@ -1,14 +1,14 @@
-# How xx works
+# How oats works
 
-xx keeps audio as the source of truth and treats transcripts as editable interpretations of it. Tauri/Rust manages the desktop and capture; Next.js/React provides the interface; SQLite stores meeting metadata. Separate Python workers run local ASR and optional speakers.
+oats keeps audio as the source of truth and treats transcripts as editable interpretations of it. Tauri/Rust manages the desktop and capture; Next.js/React provides the interface; SQLite stores meeting metadata. Separate Python workers run local ASR and optional speakers.
 
 ## From recording to transcript
 
 1. **Open a new note.** Choose a project on the home screen, then click New note. This action starts microphone and system-audio capture and opens the writing canvas. Tracks are written independently with a session manifest and timing journal. Capture does not depend on a model loading successfully. Recording options remain available in the bottom bar.
 2. **Save before inference.** The worker builds bounded mono windows from saved audio on the session clock. Gaps and interruptions remain visible. Original tracks stay available for recovery.
-3. **Write while xx listens.** Notes autosave independently. Open the transcript with the microphone/up-arrow control when you want to check it. Trelis processes saved 20-second windows during the call using OpenVINO GPU FP16. It preserves the original Hindi/English script, and its raw output is retained as it arrives.
+3. **Write while oats listens.** Notes autosave independently. Open the transcript with the microphone/up-arrow control when you want to check it. Choose Trelis windows of 5, 10, or 20 seconds; new settings default to 10 seconds. A conservative Silero gate checks each window before local OpenVINO GPU inference and retains uncertain speech. Trelis preserves the original Hindi/English script.
 4. **Stop and finish remaining audio.** Stopping capture lets the same Trelis job drain its backlog and process the final partial window. The display changes from Live transcript to Finishing transcript, then Final transcript on completion. There is no second full pass. “Final” means processing finished, not human verification.
-5. **Flag suspicious output.** Quiet input, gaps, repetition, or substantial audio with sparse text can trigger flags and bounded retries. Original results and alternatives remain available. A longer retry is not proof of better recognition.
+5. **Flag suspicious output.** Quiet input, gaps, repetition, or substantial audio with sparse text can trigger flags. Long repeated phrases in a Trelis window longer than 5 seconds trigger one retry in disjoint 5-second pieces. Successful pieces without another long loop replace the displayed result; original recognition and retry provenance remain saved. Failed or still repetitive retries retain the original result and require review. A 5-second primary window is not retried recursively.
 6. **Review speakers.** Optional Community-1 runs after recording and transcription complete. Turns are mapped to transcript windows, overlapping candidates remain explicit, and manual names survive reconciliation. Live individual speaker identification remains future work.
 7. **Keep notes or hand off.** Review the transcript, edit text, name speakers, add notes, and play the related audio. Trelis remains the primary version; an explicitly requested Apex fallback has its own notes and corrections. Export or hand the selected version to Claude yourself.
 
@@ -30,16 +30,44 @@ flowchart LR
     F --> G[User-controlled Claude handoff]
 ```
 
+## How each piece of audio becomes text
+
+```mermaid
+flowchart TD
+    A["Choose audio pieces of 5, 10, or 20 seconds<br/>Default: 10 seconds"] --> B["Record and save the audio"]
+    B --> C["Take the next piece of audio"]
+    C --> D{"Does Silero detect speech?"}
+    D -->|No| E["Skip this piece"]
+    D -->|"Yes or unsure"| F["Trelis turns the speech into text"]
+    F --> G{"Is the text stuck repeating?"}
+    G -->|No| H["Keep the text"]
+    G -->|Yes| I{"Already a 5-second piece?"}
+    I -->|Yes| J["Keep the original text<br/>Mark it for review"]
+    I -->|No| K["Try once more in 5-second pieces<br/>Check for speech in each piece"]
+    K --> L{"Did the retry produce text<br/>without another repetition loop?"}
+    L -->|Yes| M["Use the new text<br/>Keep the original for comparison"]
+    L -->|"No or retry failed"| J
+    E --> N["Continue with the next piece<br/>until the recording is finished"]
+    H --> N
+    J --> N
+    M --> N
+    N --> C
+```
+
+Even one second of detected speech keeps the whole piece. If the speech check is unsure or fails, the app still tries to transcribe it. The original recording is always kept, and retried text is marked for review. There is only one retry; a 5-second piece is never split again. If transcription fails, the recording remains available to try again later.
+
+The app can also offer a shorter retry when there is substantial audio but surprisingly little text. These checks help with specific problems and do not guarantee accurate transcription. Soft repetition penalties were tested separately and are not enabled in this flow.
+
 ## Models and timing
 
 | Profile | Execution | Output | Current role |
 | --- | --- | --- | --- |
-| Trelis · 20 seconds | Pinned OpenVINO GPU FP16 environment and verified stateful export | Devanagari and English | Default live transcript; same job finishes after stopping |
+| Trelis · 5, 10, or 20 seconds | Pinned OpenVINO GPU FP16 environment and verified stateful export | Devanagari and English | Default live transcript; new settings use 10 seconds; same job finishes after stopping |
 | Apex · 20 seconds | Pinned whisper.cpp CLI, Q5_0 conversion, Vulkan on the tested machine | Roman Hinglish | Explicit fallback in a separate version |
 
 The adapter preserves Trelis's custom mixed-code prefix, greedy decoding, 440-token generation limit, and original script. The FP16 export retains the original tokenizer and vocabulary; no INT8 conversion or transliteration is used. The GPU is selected explicitly, and a GPU failure is visible rather than silently changing to CPU. Apex uses its documented English/transcribe decoding profile for Roman output. Exact model revisions are in [`models.json`](../stt_lab/models.json); local configurations record paths and runtime settings.
 
-A 20-second window is a processing unit, not a guarantee that an update appears exactly 20 seconds later. Compute and queueing add delay; loading and compiling the GPU model adds startup time. Separate microphone and system tracks require separate inference requests. A call with two fully processed tracks can cost approximately twice a single-track engine run before retries or speakers are added. Segment times identify source-window boundaries, not validated word-level alignments.
+A chunk duration is a processing unit, not a guarantee that an update appears immediately when its audio ends. Compute and queueing add delay; loading and compiling the GPU model adds startup time. Separate microphone and system tracks require separate inference requests. A call with two fully processed tracks can cost approximately twice a single-track engine run before retries or speakers are added. Segment times identify source-window boundaries, not validated word-level alignments.
 
 The isolated acceleration experiment on an Intel Ultra 7 268V / Arc 140V laptop found:
 
@@ -51,7 +79,9 @@ The integrated adapter in its independent deployment environment also matched al
 
 The replay **did not pass the strict timing gate**. First text appeared at 49.8 seconds, with 44.5 seconds spent verifying/importing/loading/compiling the model. Window-end delay was 8.5 seconds at the median and 29.8 seconds at the 95th percentile; the oldest audio in a window had a 49.8-second 95th-percentile delay. Both tracks also exceeded the test's late-delay slope threshold. This did not establish a continuously growing queue: every pair after the initial window finished before the next pair was due, and completed-window backlog repeatedly cleared. Full completion is evidence of throughput and checkpoint integrity, not a passing live-latency result. Startup and variable inference time remain visible limitations; neither a 5–15-second speech-to-display target nor 90-minute stability is qualified.
 
-The earlier single-track warm extrapolation of roughly 12–15 minutes for a 90-minute recording, or 24–30 minutes for two fully processed tracks, remains only a planning estimate before startup, retries and speakers. The live workflow normally finishes only the remaining queued audio after stop, so a full post-call estimate does not describe its usual behavior. Speech detection skipped no windows in the engine study and is not enabled as an acceleration shortcut.
+The earlier single-track warm extrapolation of roughly 12–15 minutes for a 90-minute recording, or 24–30 minutes for two fully processed tracks, remains only a planning estimate before startup, retries and speakers. The live workflow normally finishes only the remaining queued audio after stop, so a full post-call estimate does not describe its usual behavior. These engine-study measurements predate the conservative speech gate and the 5/10-second profiles.
+
+Silero checks the full window on CPU, including an analysis-only amplified pass to protect quiet speech. It skips a window only when both passes remain below the conservative threshold; even a brief detected utterance keeps the full window. Missing models, unsupported interfaces, or detection errors retain the audio and attach a warning. The ASR waveform is not amplified or denoised by this gate. Setup copies a verified local ONNX asset into a durable model directory; no inference download occurs.
 
 Chunk boundaries and decoding can affect omissions and repetition. Language biases, ambiguous acoustics, overlap, and recording quality can affect names, numbers, and unit words. A retry cannot reconstruct speech that was never recorded, and a glossary does not prove what was said. Flags narrow review work; they do not guarantee an error-free transcript.
 

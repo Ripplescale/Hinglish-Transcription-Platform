@@ -20,11 +20,12 @@ LAB=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(LAB))
 from sttbench.manifest import digest, file_digest, read_json, write_json
 from sttbench.runtime.assets import verify_model_assets, verify_openvino_assets
-from install_local_worker import install_worker_source, activate_runtime, _write_new_json
+from install_local_worker import install_worker_source, install_speech_gate, activate_runtime, _write_new_json
 
 
 PACKAGES={'openvino':'2026.4.0','optimum-intel':'2.2.0','optimum':'2.3.0',
           'transformers':'4.57.6','torch':'2.8.0+cpu','numpy':'2.2.6','tokenizers':'0.22.2'}
+ENVIRONMENT_PACKAGES={**PACKAGES,'onnxruntime':'1.30.0'}
 REVISION='eab1188fd2d0e91f2584229b32b3bfe1901c896c'
 
 
@@ -39,13 +40,13 @@ def _inspect_environment(root: Path, python: Path):
         raise ValueError('OpenVINO environment must not borrow the Whisper environment')
     code=('import sys,json,importlib.metadata as m; '
           'print(json.dumps({"python_version":".".join(map(str,sys.version_info[:3])), '
-          '"prefix":sys.prefix,"paths":sys.path,"packages":{n:m.version(n) for n in '+repr(list(PACKAGES))+'}}))')
+          '"prefix":sys.prefix,"paths":sys.path,"packages":{n:m.version(n) for n in '+repr(list(ENVIRONMENT_PACKAGES))+'}}))')
     process=subprocess.run([str(python),'-I','-B','-c',code],check=True,capture_output=True,text=True,
                            timeout=60,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     info=json.loads(process.stdout.strip())
     if info['python_version']!='3.12.14' or Path(info['prefix']).resolve()!=expected.resolve():
         raise ValueError('OpenVINO Python identity does not match the independent 3.12.14 environment')
-    if info['packages']!=PACKAGES:
+    if info['packages']!=ENVIRONMENT_PACKAGES:
         raise ValueError('OpenVINO environment package versions differ from the validated pins')
     for path in info['paths']:
         if 'site-packages' in path.lower() and not Path(path).resolve().is_relative_to(expected.resolve()):
@@ -111,7 +112,7 @@ def _copy_export(root: Path, export_source: Path, spec: dict):
     return target,copied
 
 
-def prepare(root: Path, export_source: Path, python: Path | None=None, *, activate=False):
+def prepare(root: Path, export_source: Path, python: Path | None=None, *, activate=False, speech_gate_model: Path | None=None):
     root=root.resolve(strict=True);export_source=export_source.resolve(strict=True)
     if any(part.lower().startswith('onedrive') for part in root.parts):
         raise ValueError('Keep runtime and models outside OneDrive')
@@ -131,6 +132,7 @@ def prepare(root: Path, export_source: Path, python: Path | None=None, *, activa
     cache.mkdir(parents=True,exist_ok=True)
     candidate=copy.deepcopy(current)
     candidate.update(worker)
+    candidate['speech_gate']=install_speech_gate(root,speech_gate_model)
     candidate['python_executable']=str(python)
     candidate['models']['trelis'].update(backend='openvino',export_path=str(target),cache_dir=str(cache),
                                         device='GPU',dtype='float16',threads=4,num_beams=1,
@@ -161,10 +163,12 @@ if __name__=='__main__':
     source.add_argument('--candidate',type=Path,help='Previously prepared candidate to activate')
     parser.add_argument('--python',type=Path,help='Independent openvino-py312 executable under the data root')
     parser.add_argument('--activate',action='store_true',help='Only after normal app shutdown: preserve legacy job runtimes and activate')
+    parser.add_argument('--speech-gate-model',type=Path,help='Verified local Silero ONNX model; otherwise use the pinned Rust cache')
     arguments=parser.parse_args()
     if arguments.candidate:
         if not arguments.activate:parser.error('--candidate requires explicit --activate')
         result=activate_runtime(arguments.data_root,arguments.candidate)
     else:
-        result=prepare(arguments.data_root,arguments.export_source,arguments.python,activate=arguments.activate)
+        result=prepare(arguments.data_root,arguments.export_source,arguments.python,activate=arguments.activate,
+                       speech_gate_model=arguments.speech_gate_model)
     print(json.dumps(result,ensure_ascii=False))

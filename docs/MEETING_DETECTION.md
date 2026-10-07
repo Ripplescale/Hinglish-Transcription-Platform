@@ -1,14 +1,14 @@
 # Zoom and Teams call prompts (Windows)
 
-When xx is running, an active microphone session belonging to the Zoom or
+When oats is running, an active microphone session belonging to the Zoom or
 Microsoft Teams desktop app can trigger a small side window. Choose **Record
 call** to enter the normal recording flow with the selected microphone and system
 audio device. **Dismiss**, Escape, or closing the prompt suppresses it for the
 current activity. Recording never starts from detection alone.
 
 Toggle this under **Settings → Recording → Zoom & Teams call prompts**. The
-preference is saved locally. Closing the main window leaves xx in the tray;
-quitting xx stops detection. There is no added Windows login startup task.
+preference is saved locally. Closing the main window leaves oats in the tray;
+quitting oats stops detection. There is no added Windows login startup task.
 
 The detector inspects Windows audio-session state and process names. It does not
 read audio samples, email, calendar entries, window titles, or meeting content.
@@ -51,7 +51,7 @@ expired prompts, and layout within the popup dimensions. It does not record.
 
 A real-device acceptance pass must still cover joining/leaving both desktop apps,
 muted calls, Teams WebView attribution, headset switching, reconnects, dismissing,
-starting while xx is hidden, and disabling prompts. Verify that selected-device
+starting while oats is hidden, and disabling prompts. Verify that selected-device
 capture contains both sides of the call. Synthetic checks cannot establish those
 results.
 

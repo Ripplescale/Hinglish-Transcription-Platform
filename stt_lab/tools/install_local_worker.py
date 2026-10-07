@@ -17,6 +17,36 @@ LAB=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(LAB))
 from sttbench.manifest import read_json, write_json, file_digest, digest
 
+SILERO_SHA256='a35ebf52fd3ce5f1469b2a36158dba761bc47b973ea3382b3186ca15b1f5af28'
+
+
+def install_speech_gate(root: Path, source: Path | None=None):
+    """Copy the pinned local VAD asset; never download or alter existing weights.
+
+    A missing asset stays explicit in the config so the worker retains speech
+    with an unavailable-gate warning rather than suppressing any input.
+    """
+    target=root/'lab/models/silero'/SILERO_SHA256/'silero_vad.onnx'
+    if source is None and not target.is_file():
+        cached=sorted((root/'lab/rust/cargo/git/checkouts').glob('silero-rs-*/26a6460/models/silero_vad.onnx'))
+        source=next((path for path in cached if file_digest(path)==SILERO_SHA256),None)
+    if source is not None:
+        source=source.resolve(strict=True)
+        if file_digest(source)!=SILERO_SHA256:
+            raise ValueError('Silero model does not match the pinned SHA-256')
+        if not target.exists():
+            target.parent.mkdir(parents=True,exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix='.silero-',dir=target.parent) as temporary:
+                staged=Path(temporary)/target.name
+                shutil.copyfile(source,staged)
+                if file_digest(staged)!=SILERO_SHA256:
+                    raise ValueError('Copied Silero model failed verification')
+                os.link(staged,target)
+    if target.exists() and file_digest(target)!=SILERO_SHA256:
+        raise ValueError('Installed Silero model differs from the pinned SHA-256')
+    return {'model_path':str(target.resolve()),'model_sha256':SILERO_SHA256,
+            'threshold':0.15,'boost_peak':0.25,'max_gain':1000}
+
 
 def install_worker_source(root: Path):
     """Install an immutable, verified worker copy without activating it."""
@@ -125,6 +155,11 @@ def _legacy_snapshot_plan(root: Path, old_runtime: dict):
                     spec,model_runtime=_job_model(runtime,request)
                     if (spec==identity.get('spec') and model_runtime==identity.get('runtime')
                             and _worker_hash(runtime)==identity.get('worker_sha256')):
+                        if 'speech_gate' in identity:
+                            gate_worker=Path(runtime['worker_script']).parent/'sttbench/speech_gate.py'
+                            if (runtime.get('speech_gate')!=identity['speech_gate']
+                                    or file_digest(gate_worker)!=identity.get('speech_gate_worker_sha256')):
+                                continue
                         _validate_runtime_files(runtime)
                         matches.append((label,runtime))
                 except (OSError,ValueError,KeyError,TypeError,StopIteration):
@@ -185,13 +220,34 @@ def activate_runtime(root: Path, candidate_path: Path):
     return {'runtime':str(active),'activated':True,'snapshots_created':len(plan),'snapshots_retained':retained}
 
 
-def install(root: Path, study: Path, python: Path, *, activate=True):
+def update_existing(root: Path, *, activate=False, speech_gate_model: Path | None=None):
+    """Stage the current worker and gate without re-exporting or changing ASR models."""
+    root=root.resolve(strict=True)
+    active=root/'runtime.json'
+    original_sha=file_digest(active)
+    value=copy.deepcopy(read_json(active))
+    value.update(install_worker_source(root))
+    value['speech_gate']=install_speech_gate(root,speech_gate_model)
+    _validate_runtime_files(value)
+    candidate=root/'runtime'/f'candidate-worker-{digest(value)[:16]}.json'
+    if not candidate.exists():_write_new_json(candidate,value)
+    elif read_json(candidate)!=value:raise ValueError('Candidate runtime collision')
+    if file_digest(active)!=original_sha:
+        raise ValueError('Active runtime changed during worker preparation; no activation performed')
+    outcome=activate_runtime(root,candidate) if activate else {'runtime':str(candidate),'activated':False}
+    return {**outcome,'candidate_runtime':str(candidate),'source_id':value['worker_source_id'],
+            'speech_gate_available':Path(value['speech_gate']['model_path']).is_file(),
+            'original_runtime_sha256':original_sha,'model_downloads':False}
+
+
+def install(root: Path, study: Path, python: Path, *, activate=True, speech_gate_model: Path | None=None):
     root=root.resolve();study=study.resolve();python=python.resolve(strict=True)
     worker=install_worker_source(root)
     configs={m:read_json(study/'configs'/f'{m}.json') for m in ('apex','trelis')}
     for config in configs.values():
         if not Path(config['artifact_path']).exists():raise ValueError('Local model unavailable')
     value={'version':1,'python_executable':str(python),**worker,'models':configs,
+           'speech_gate':install_speech_gate(root,speech_gate_model),
            'summaries_enabled':False,'network_inference':False}
     candidate=root/'runtime'/f'candidate-{digest(value)[:16]}.json'
     if not candidate.exists():_write_new_json(candidate,value)
@@ -207,7 +263,17 @@ def install(root: Path, study: Path, python: Path, *, activate=True):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--data-root',type=Path,required=True);p.add_argument('--study',type=Path,required=True)
-    p.add_argument('--python',type=Path,required=True)
+    p.add_argument('--data-root',type=Path,required=True)
+    source=p.add_mutually_exclusive_group(required=True)
+    source.add_argument('--study',type=Path)
+    source.add_argument('--update-existing',action='store_true',help='Reuse the active ASR model/environment configuration')
+    p.add_argument('--python',type=Path,help='Required with --study')
     p.add_argument('--no-activate',action='store_true',help='Prepare a candidate without replacing runtime.json')
-    a=p.parse_args();print(json.dumps(install(a.data_root,a.study,a.python,activate=not a.no_activate)))
+    p.add_argument('--speech-gate-model',type=Path,help='Verified local Silero ONNX model; otherwise use the pinned Rust cache')
+    a=p.parse_args()
+    if a.update_existing:
+        result=update_existing(a.data_root,activate=not a.no_activate,speech_gate_model=a.speech_gate_model)
+    else:
+        if not a.python:p.error('--study requires --python')
+        result=install(a.data_root,a.study,a.python,activate=not a.no_activate,speech_gate_model=a.speech_gate_model)
+    print(json.dumps(result))

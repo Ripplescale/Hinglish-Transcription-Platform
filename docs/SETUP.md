@@ -1,17 +1,17 @@
-# Windows setup for xx
+# Windows setup for oats
 
-xx is currently a Windows x64 application with a separately prepared local model runtime. **The existing installer is for the already configured laptop.** It does not yet provide a complete, tested first-run installation on an arbitrary PC. This guide separates that installation from the developer setup needed elsewhere.
+oats is currently a Windows x64 application with a separately prepared local model runtime. **The existing installer is for the already configured laptop.** It does not yet provide a complete, tested first-run installation on an arbitrary PC. This guide separates that installation from the developer setup needed elsewhere.
 
 ## Using an existing installation
 
-Close any running instance of xx normally before upgrading, then run the locally supplied xx setup program and open **xx** from Start. The upgrade retains the existing local workspace. Opening xx shows your notes without starting recording.
+Close any running instance of oats (or its earlier xx version) normally before upgrading, then run the locally supplied oats setup program and open **oats** from Start. The upgrade retains the existing local workspace. Opening oats shows your notes without starting recording.
 
 The default window is a narrow 680 × 820 writing space, fitted to the available screen. Windows' maximize button extends it to the top and bottom of the usable display while keeping its current width. Restore returns to the previous size and position. Drag a side edge to choose another width.
 
 The install includes the desktop application, FFmpeg, and required Microsoft C++ runtime files. It reuses the existing local models and Python environments. Its adjacent `sttapp-local-install.json` points to the data root; do not commit this machine-specific file.
 
 1. Check the local runtime status, microphone, and system-audio device.
-2. Choose the call language. New recordings use **Trelis · 20 seconds · OpenVINO GPU FP16** for the live transcript, preserving original Hindi/English script. Model loading adds startup time, and each update takes a 20-second window plus processing time.
+2. Choose the call language and Trelis chunk duration: **5, 10, or 20 seconds**. New settings use **10 seconds**, and saved choices are retained. OpenVINO GPU FP16 preserves original Hindi/English script. Model loading adds startup time; each update takes a window plus processing time. Long repetitions trigger one bounded retry in 5-second pieces.
 3. Select a project, then click **New note** at the top right. This immediately starts microphone and system-audio recording and opens a blank notes editor. Notes autosave; the **Transcript** control beside the recording controls reveals live text. For a short test, choose **Finish recording** and let the same job finish remaining audio; there is no second full pass. Check playback and the transcript before relying on a longer call.
 4. If Trelis needs attention, choose **Use Apex fallback**. The app pauses Trelis after its current window and imports its last output before Apex replays the saved audio as a separate version. GPU errors are shown, without a silent Trelis CPU fallback.
 5. Review the transcript and edit text or speakers where needed. “Final transcript” means processing completed, not that a person checked it. Copy/export into Claude only when you want to review and send it yourself.
@@ -91,6 +91,10 @@ $utf8 = [Text.UTF8Encoding]::new($false)
 
 This writes a content-addressed copy of the worker and `runtime.json`. It does not copy recordings or download weights. Paths and asset provenance are validated during inference. Keep the original checkpoint and conversion records outside Git.
 
+For the conservative speech gate, supply `--speech-gate-model C:\LocalModels\silero_vad.onnx` to this installer or the OpenVINO preparation tool. It accepts the pinned model SHA-256 `a35ebf52fd3ce5f1469b2a36158dba761bc47b973ea3382b3186ca15b1f5af28`, also available from the existing `silero-rs` revision `26a6460` Rust cache. The installer copies and verifies it under `lab/models/silero`, and the runtime Python needs `onnxruntime` (included in the OpenVINO lock). If no verified model is available, the worker retains all uncertain input and records `speech_gate_unavailable`; it never substitutes an energy-only speech filter.
+
+For an existing installation, stage the updated worker and speech gate with `install_local_worker.py --data-root $sttRoot --update-existing --no-activate`. It retains the current Python and ASR model configuration, creates an immutable candidate, and leaves existing jobs untouched. After saving notes and closing the app normally, run the same command without `--no-activate` to preserve historical runtime snapshots and activate. Deploy the updated desktop app and worker together for the new chunk profiles.
+
 ## Prepare Trelis OpenVINO GPU
 
 The GPU path uses a separate, independently installed environment. The experimental environment that borrowed dependencies from another environment is not a deployment dependency. The pinned lock includes Python **3.12.14**, torch **2.8.0+cpu**, transformers **4.57.6**, optimum-intel **2.2.0**, optimum **2.3.0**, and OpenVINO **2026.4.0**. CPU torch is used by the export/runtime support code; OpenVINO performs inference explicitly on the GPU.
@@ -153,7 +157,7 @@ The current packaging helper, [`build-local-windows.ps1`](../frontend/src-tauri/
   -BuildToolsPath 'C:\BuildTools-STT' -TargetRoot 'C:\STTBuild\target'
 ```
 
-Those short build paths are examples; choose writable locations for your installation. The helper creates a machine-specific runtime pointer and bundles verified runtime DLLs. Review licenses before distributing a binary. Inherited upstream CI/release recipes are not a supported xx release pipeline.
+Those short build paths are examples; choose writable locations for your installation. The helper creates a machine-specific runtime pointer and bundles verified runtime DLLs. Review licenses before distributing a binary. Inherited upstream CI/release recipes are not a supported oats release pipeline.
 
 An optional [`Install-PrivatePythonBase.ps1`](../frontend/src-tauri/scripts/Install-PrivatePythonBase.ps1) copies and verifies an existing CPython **3.12.14** base and can rebind the prepared environments. Supply `-SourceBase` explicitly. It does not download Python; stop worker processes before using its activation option.
 

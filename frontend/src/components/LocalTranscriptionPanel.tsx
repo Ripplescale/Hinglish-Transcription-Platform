@@ -6,7 +6,7 @@ import { useRouter } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { useLocalWorkflow } from '@/contexts/LocalWorkflowContext';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
-import { isTerminalJob, pathKey, type LocalJob, type LocalPreferences, type LocalProfile } from '@/lib/local-transcription-workflow';
+import { isTerminalJob, isTrelisProfile, pathKey, profileChunkSeconds, trelisProfile, type LocalJob, type LocalPreferences, type LocalProfile, type TrelisProfileId } from '@/lib/local-transcription-workflow';
 
 export function LocalTranscriptionPanel({ sessionDir, meetingId, projectId = null }: { sessionDir?: string; meetingId?: string; projectId?: string | null }) {
   const { state, workflow } = useLocalWorkflow();
@@ -18,28 +18,32 @@ export function LocalTranscriptionPanel({ sessionDir, meetingId, projectId = nul
   const [selectedJob, setSelectedJob] = useState<string>();
   const router = useRouter();
   const { preferences } = state;
-  const [rerunProfile, setRerunProfile] = useState<LocalPreferences['profile']>('trelis-20');
+  const [rerunProfile, setRerunProfile] = useState<LocalPreferences['profile']>(trelisProfile(preferences.profile));
+  const [rerunTrelisProfile, setRerunTrelisProfile] = useState<TrelisProfileId>(trelisProfile(preferences.profile));
   const [rerunLanguage, setRerunLanguage] = useState<LocalPreferences['languageMode']>(preferences.languageMode);
-  const selectedProfile = meetingId ? rerunProfile : 'trelis-20';
-  const selectedLanguage = meetingId ? rerunLanguage : preferences.languageMode;
   const matchingRuns = sessionDir ? state.runs.filter(item => pathKey(item.capture.session_dir) === pathKey(sessionDir)) : state.runs.filter(item => item.capture.session_id === state.currentSession);
   const run = (selectedJob ? matchingRuns.find(item => item.job?.job_id === selectedJob) : undefined) ?? matchingRuns.find(item => meetingId && item.transcriptMeetingId === meetingId) ?? matchingRuns.find(item => item.job && !isTerminalJob(item.job.state)) ?? matchingRuns.find(item => item.role === 'live-final' || item.role === 'final') ?? matchingRuns[0];
   const job = run?.job;
   const trelisRun = matchingRuns.find(item => item.role === 'live-final');
   const fallbackRun = matchingRuns.find(item => item.role === 'fallback');
+  const selectedProfile = meetingId ? rerunProfile : trelisProfile(isRecording ? trelisRun?.preferences.profile ?? preferences.profile : preferences.profile);
+  const selectedLanguage = meetingId ? rerunLanguage : isRecording ? trelisRun?.preferences.languageMode ?? preferences.languageMode : preferences.languageMode;
   const active = state.runs.some(item => (item.job && !isTerminalJob(item.job.state)) || (item.speakerJob && !isTerminalJob(item.speakerJob.state)));
   const currentProfile = profiles.find(profile => profile.id === selectedProfile);
   const update = (patch: Partial<LocalPreferences>) => {
     if (meetingId) {
-      if (patch.profile) setRerunProfile(patch.profile);
+      if (patch.profile) {
+        setRerunProfile(patch.profile);
+        if (isTrelisProfile(patch.profile)) setRerunTrelisProfile(patch.profile);
+      }
       if (patch.languageMode) setRerunLanguage(patch.languageMode);
-    } else workflow.setPreferences({ ...preferences, languageMode: patch.languageMode ?? preferences.languageMode });
+    } else workflow.setPreferences({ ...preferences, ...patch });
   };
   const openTranscript = (id: string) => {
     const href = `/meeting-details?id=${encodeURIComponent(id)}`;
     if (window.dispatchEvent(new CustomEvent('xx-before-navigate', { cancelable: true, detail: { href } }))) router.push(href);
   };
-  const loadProfiles = () => invoke<LocalProfile[]>('get_local_stt_profiles').then(result => { setProfiles(result.filter(profile => ['trelis-20', 'apex-20'].includes(profile.id))); setError(null); }).catch(reason => setError(String(reason)));
+  const loadProfiles = () => invoke<LocalProfile[]>('get_local_stt_profiles').then(result => { setProfiles(result.filter(profile => isTrelisProfile(profile.id) || profile.id === 'apex-20')); setError(null); }).catch(reason => setError(String(reason)));
 
   useEffect(() => { void loadProfiles(); }, []);
   useEffect(() => {
@@ -68,11 +72,13 @@ export function LocalTranscriptionPanel({ sessionDir, meetingId, projectId = nul
     <div className="flex flex-wrap items-center justify-between gap-2"><h2 className="text-sm font-medium">{meetingId ? 'For another version' : 'Every recording, taken care of'}</h2><span className="text-[11px] text-[var(--xx-muted)]">On this device</span></div>
     {!meetingId && <p className="text-sm leading-6">Trelis live transcript <span className="mx-1 text-[var(--xx-muted)]">·</span> Apex available as a fallback</p>}
     <div className="flex flex-wrap gap-3">
-      {meetingId && <label className="min-w-0 flex-[1_1_220px] text-xs text-[var(--xx-muted)] space-y-1.5"><span className="block">Model for this version</span><select aria-label="Local transcription profile" className="w-full min-w-0 rounded-lg border border-[var(--xx-border)] bg-[var(--xx-paper)] p-2 text-sm text-[var(--xx-ink)] focus:outline-[var(--xx-accent)]" disabled={isRecording || busy} value={selectedProfile} onChange={event => update({ profile: event.target.value as LocalPreferences['profile'] })}><option value="trelis-20">Trelis · 20s · Hindi + English script</option><option value="apex-20">Apex · 20s · Roman Hinglish</option></select></label>}
+      {meetingId && <label className="min-w-0 flex-[1_1_220px] text-xs text-[var(--xx-muted)] space-y-1.5"><span className="block">Model for this version</span><select aria-label="Local transcription profile" className="w-full min-w-0 rounded-lg border border-[var(--xx-border)] bg-[var(--xx-paper)] p-2 text-sm text-[var(--xx-ink)] focus:outline-[var(--xx-accent)]" disabled={isRecording || busy} value={selectedProfile === 'apex-20' ? 'apex-20' : rerunTrelisProfile} onChange={event => update({ profile: event.target.value as LocalPreferences['profile'] })}><option value={rerunTrelisProfile}>Trelis · Hindi + English script</option><option value="apex-20">Apex · 20s · Roman Hinglish</option></select></label>}
+      {isTrelisProfile(selectedProfile) && <label className="min-w-0 flex-[1_1_130px] text-xs text-[var(--xx-muted)] space-y-1.5"><span className="block">Trelis chunk length</span><select aria-label="Trelis chunk length" aria-describedby={meetingId ? 'rerun-chunk-help' : 'recording-chunk-help'} className="w-full rounded-lg border border-[var(--xx-border)] bg-[var(--xx-paper)] p-2 text-sm text-[var(--xx-ink)] focus:outline-[var(--xx-accent)]" disabled={isRecording || busy} value={selectedProfile} onChange={event => update({ profile: event.target.value as TrelisProfileId })}><option value="trelis-5">5 seconds</option><option value="trelis-10">10 seconds (default)</option><option value="trelis-20">20 seconds</option></select></label>}
       <label className="flex-[1_1_100px] text-xs text-[var(--xx-muted)] space-y-1.5"><span className="block">Language</span><select aria-label="Recording language" className="w-full rounded-lg border border-[var(--xx-border)] bg-[var(--xx-paper)] p-2 text-sm text-[var(--xx-ink)] focus:outline-[var(--xx-accent)]" disabled={isRecording || busy} value={selectedLanguage} onChange={event => update({ languageMode: event.target.value as LocalPreferences['languageMode'] })}><option value="hinglish">Hinglish</option><option value="english">English</option></select></label>
     </div>
-    {!meetingId && <p className="text-xs leading-5 text-[var(--xx-muted)]">Trelis adds text in 20-second windows, plus processing time, in its original Hindi + English script. After you stop, it finishes the remaining audio. You can switch to an Apex fallback version if Trelis needs attention.</p>}
-    {(meetingId ? profiles.filter(profile => profile.id === currentProfile?.id && !profile.available) : profiles.filter(profile => !profile.available)).map(profile => <div key={profile.id} className="text-xs text-amber-800"><p>{profile.id === 'apex-20' ? 'Apex' : 'Trelis'}: {profile.reason || 'The model is not installed. You can still record and transcribe later.'}</p><button type="button" className="underline mt-1" onClick={() => void loadProfiles()}>Check model setup again</button></div>)}
+    {isTrelisProfile(selectedProfile) && <p id={meetingId ? 'rerun-chunk-help' : 'recording-chunk-help'} className="text-xs leading-5 text-[var(--xx-muted)]">Shorter chunks give the model less context and require more processing calls. Repetitive chunks longer than 5 seconds are retried in 5-second windows.</p>}
+    {!meetingId && <p className="text-xs leading-5 text-[var(--xx-muted)]">Trelis adds text in {profileChunkSeconds(selectedProfile)}-second windows, plus processing time, in its original Hindi + English script. After you stop, it finishes the remaining audio. This choice applies to your next recording. You can switch to an Apex fallback version if Trelis needs attention.</p>}
+    {profiles.filter(profile => !profile.available && (profile.id === selectedProfile || (!meetingId && profile.id === 'apex-20'))).map(profile => <div key={profile.id} className="text-xs text-amber-800"><p>{profile.id === 'apex-20' ? 'Apex' : 'Trelis'}: {profile.reason || 'The model is not installed. You can still record and transcribe later.'}</p><button type="button" className="underline mt-1" onClick={() => void loadProfiles()}>Check model setup again</button></div>)}
     {error && <p role="alert" className="text-xs text-red-700">{error}</p>}
     {run?.error && <p role="alert" className="text-xs text-amber-800">{run.error}</p>}
     {job?.phase === 'loading_model' && !isTerminalJob(job.state) && <p role="status" className="text-xs leading-5 text-[var(--xx-muted)]">Loading Trelis. Your audio is being saved while the model gets ready; the first transcript can take about a minute.</p>}

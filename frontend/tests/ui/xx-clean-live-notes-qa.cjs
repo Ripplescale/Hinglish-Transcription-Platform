@@ -22,13 +22,13 @@ async function installCleanLiveFixture(page) {
       { id: 'cedar', name: 'Project Cedar Vault', revision: 0, entry_count: 0 },
     ];
     const notes = [
-      { id: 'qa-meeting', title: 'Project Willow · Friday catch-up', created_at: '2026-09-30T09:30:00Z', project_id: 'willow', notes_preview: 'Prepare sketchbooks for the studio workshop.' },
-      { id: 'qa-planning', title: 'Planning for next month', created_at: '2026-09-29T12:00:00Z', project_id: 'cedar', notes_preview: 'A fictional courtyard exhibition.' },
-      { id: 'qa-design', title: 'Product catch-up', created_at: '2026-09-28T10:00:00Z', project_id: null, notes_preview: 'Choose a new notebook cover.' },
+      { id: 'qa-meeting', title: 'Project Willow · Friday catch-up', created_at: '2026-10-07T09:30:00Z', project_id: 'willow', notes_preview: 'Prepare sketchbooks for the studio workshop.' },
+      { id: 'qa-planning', title: 'Planning for next month', created_at: '2026-10-06T12:00:00Z', project_id: 'cedar', notes_preview: 'A fictional courtyard exhibition.' },
+      { id: 'qa-design', title: 'Product catch-up', created_at: '2026-10-05T10:00:00Z', project_id: null, notes_preview: 'Choose a new notebook cover.' },
     ];
     let live = { version: 1, meeting_id: 'qa-live', revision: 0, notes: '', project_id: null,
       corrections: [], speaker_names: {}, segment_metadata: {}, speaker_metadata: null,
-      source_meeting_id: 'qa-live', source_job_id: 'qa-live-job', profile: 'trelis-20', workflow_role: 'live-final' };
+      source_meeting_id: 'qa-live', source_job_id: 'qa-live-job', profile: 'trelis-10', workflow_role: 'live-final' };
     let title = 'Untitled note';
     const raw = [
       { id: 'clean-first', text: 'आज Project Willow की workshop plan करते हैं. We need 24 sketchbooks.', source_track: 'system', start_seconds: 0, end_seconds: 20 },
@@ -41,7 +41,7 @@ async function installCleanLiveFixture(page) {
     window.qaCleanSetText = () => { if (!job) throw Error('No synthetic job'); job.phase = 'transcribing'; job.segments = clone(raw); job.processed_audio_seconds = 40; job.available_audio_seconds = 40; job.backlog_seconds = 0; };
     window.qaCleanFailNextStart = false;
     window.qaCleanFailWorker = () => { if (!job) throw Error('No synthetic job'); job.state = 'failed'; job.error = 'Synthetic worker unavailable'; };
-    window.qaCleanAddOrphan = () => { notes.push({ id: 'qa-orphan', title: 'Sketchbook colour discussion', created_at: '2026-09-27T09:00:00Z', project_id: 'missing-project', notes_preview: 'A saved fictional note whose project metadata is unavailable.' }); window.dispatchEvent(new Event('xx-projects-updated')); };
+    window.qaCleanAddOrphan = () => { notes.push({ id: 'qa-orphan', title: 'Sketchbook colour discussion', created_at: '2026-10-04T09:00:00Z', project_id: 'missing-project', notes_preview: 'A saved fictional note whose project metadata is unavailable.' }); window.dispatchEvent(new Event('xx-projects-updated')); };
     window.qaCleanHoldSave = () => { saveGate = {}; saveGate.promise = new Promise(resolve => { saveGate.release = resolve; }); };
     window.qaCleanReleaseSave = () => { const gate = saveGate; saveGate = null; gate?.release(); };
     window.qaCleanMediaCalls = 0;
@@ -93,7 +93,7 @@ async function installCleanLiveFixture(page) {
       if (command === 'ensure_capture_meeting') { hasMeeting = true; return { meeting_id: 'qa-live' }; }
       if (command === 'start_local_transcription') {
         if (job) throw Error('Duplicate synthetic transcription job');
-        if (args.profile !== 'trelis-20' || args.workflowRole !== 'live-final') throw Error('Unexpected profile or workflow role');
+        if (args.profile !== 'trelis-10' || args.workflowRole !== 'live-final') throw Error('Unexpected profile or workflow role');
         job = { job_id: 'qa-live-job', session_dir: capture.session_dir, capture_session_id: capture.session_id,
           profile: args.profile, workflow_role: args.workflowRole, state: 'running', phase: 'loading_model', segments: [] };
         return clone(job);
@@ -102,7 +102,7 @@ async function installCleanLiveFixture(page) {
       if (command === 'get_local_transcription_status') return clone(job);
       if (command === 'import_local_transcription') { imported = job.segments.map(segment => ({ ...segment, audio_start_time: segment.start_seconds, audio_end_time: segment.end_seconds, timestamp: '15:00' })); return { meeting_id: 'qa-live' }; }
       if (command === 'get_local_transcript_groups') return [{ meeting_id: 'qa-draft', source_meeting_id: 'qa-meeting', workflow_role: 'live-draft' }];
-      if (command === 'get_local_transcript_layers' && args.meetingId === 'qa-live') return { source_meeting_id: 'qa-live', layers: [{ meeting_id: 'qa-live', title, profile: 'trelis-20', workflow_role: 'live-final', state: job?.state ?? 'running', job_id: job?.job_id, primary: true }] };
+      if (command === 'get_local_transcript_layers' && args.meetingId === 'qa-live') return { source_meeting_id: 'qa-live', layers: [{ meeting_id: 'qa-live', title, profile: 'trelis-10', workflow_role: 'live-final', state: job?.state ?? 'running', job_id: job?.job_id, primary: true }] };
       if (command === 'api_get_meetings') { const rows = await original(command, args); return [...rows, ...(hasMeeting ? [{ id: 'qa-live', title, created_at: '2026-10-03T09:30:00Z', updated_at: '2026-10-03T09:30:00Z', folder_path: capture.session_dir }] : [])]; }
       if (command === 'api_get_meeting_metadata' && args.meetingId === 'qa-live') return { id: 'qa-live', title, created_at: '2026-10-03T09:30:00Z', updated_at: '2026-10-03T09:30:00Z', folder_path: capture.session_dir };
       if (command === 'api_get_meeting_transcripts' && args.meetingId === 'qa-live') return { transcripts: clone(imported.slice(args.offset, args.offset + args.limit)), total_count: imported.length, has_more: false };
@@ -131,7 +131,7 @@ async function targetedChecks(page, report, screen, checkSize) {
   report.checks.push('All notes retains an orphaned project meeting under Unavailable project without silently dropping or reassigning it');
 
   await page.evaluate(() => { window.qaCleanFailNextStart = true; });
-  await page.locator('.xx-library-header').getByRole('button', { name: 'New note', exact: true }).click();
+  await page.locator('.xx-library-toolbar').getByRole('button', { name: 'New note', exact: true }).click();
   await page.getByRole('alert').filter({ hasText: 'Recording could not start.' }).waitFor();
   await page.getByRole('button', { name: 'Try recording again', exact: true }).waitFor();
   const failed = await page.evaluate(() => window.qaCleanState());
@@ -145,7 +145,7 @@ async function targetedChecks(page, report, screen, checkSize) {
   assert.equal(await page.locator('.xx-note-row').count(), 4);
   report.checks.push('Native-start failure is visible with retry and back actions; no hidden recording, transcription job, saved note or phantom meeting is created');
 
-  await page.locator('.xx-library-header').getByRole('button', { name: 'New note', exact: true }).click();
+  await page.locator('.xx-library-toolbar').getByRole('button', { name: 'New note', exact: true }).click();
   const editor = page.getByRole('textbox', { name: 'Live meeting notes', exact: true });
   await editor.waitFor();
   await page.waitForFunction(() => !!window.qaCleanState().job);
@@ -218,17 +218,37 @@ async function main() {
     await page.goto(origin);
     await page.getByRole('heading', { name: 'Your notes', exact: true }).waitFor();
     await page.waitForFunction(() => window.qaCalls.some(call => call.command === 'list_project_library'));
+    assert.match(await page.title(), /^oats/);
+    const sidebar = page.getByRole('complementary', { name: 'Workspace navigation' });
+    await sidebar.getByRole('img', { name: 'oats', exact: true }).waitFor();
+    await page.waitForFunction(() => [...document.querySelectorAll('.xx-brand-mascot, .xx-library-illustration')].every(image => image.complete && image.naturalWidth > 0));
+    await sidebar.getByRole('button', { name: 'Expand sidebar', exact: true }).click();
+    await page.evaluate(() => document.fonts.ready);
+    await page.waitForTimeout(250);
+    assert.equal(await sidebar.locator('.xx-wordmark').innerText(), 'oats');
+    const wordmark = await sidebar.locator('.xx-wordmark').boundingBox();
+    const collapse = await sidebar.getByRole('button', { name: 'Collapse sidebar', exact: true }).boundingBox();
+    assert.ok(wordmark && collapse && wordmark.x + wordmark.width <= collapse.x + 1, 'oats wordmark fits beside the sidebar control');
+    await checkSize('library-expanded', 1366, 768);
+    await sidebar.getByRole('button', { name: 'About oats', exact: true }).last().click();
+    const about = page.getByRole('dialog', { name: 'About oats', exact: true });
+    await about.waitFor();
+    await about.getByText('oats', { exact: true }).waitFor();
+    await page.keyboard.press('Escape');
+    await sidebar.getByRole('button', { name: 'Collapse sidebar', exact: true }).click();
+    await page.setViewportSize({ width: 920, height: 740 });
+    report.checks.push('oats title, loaded buddy mascot, expanded wordmark and About dialog remain readable and accessible');
     if (process.argv.includes('--targeted-errors')) {
       await targetedChecks(page, report, screen, checkSize);
     } else {
     assert.equal(await page.locator('.xx-library-group').count(), 3);
     assert.equal(await page.locator('.xx-note-row').count(), 3);
-    assert.equal(await page.locator('.xx-library-header').getByRole('button', { name: 'New note', exact: true }).count(), 1);
-    const newNoteBounds = await page.locator('.xx-library-header').getByRole('button', { name: 'New note', exact: true }).boundingBox();
-    const headingBounds = await page.getByRole('heading', { name: 'Your notes', exact: true }).boundingBox();
-    assert.ok(newNoteBounds.x > headingBounds.x && Math.abs(newNoteBounds.y - headingBounds.y) < 75, 'New note is in the header at the right');
+    assert.equal(await page.locator('.xx-library-toolbar').getByRole('button', { name: 'New note', exact: true }).count(), 1);
+    const newNoteBounds = await page.locator('.xx-library-toolbar').getByRole('button', { name: 'New note', exact: true }).boundingBox();
+    const searchBounds = await page.getByRole('textbox', { name: 'Search notes', exact: true }).boundingBox();
+    assert.ok(newNoteBounds.x > searchBounds.x && Math.abs((newNoteBounds.y + newNoteBounds.height / 2) - (searchBounds.y + searchBounds.height / 2)) < 4, 'New note sits beside search in the toolbar');
     for (const [width, height] of laptopSizes) await checkSize('home', width, height);
-    report.checks.push('Home groups fictional recordings into projects and Unfiled, with one top-right New note action at narrow and standard laptop sizes');
+    report.checks.push('Home groups fictional recordings into projects and Unfiled, with one New note action beside search at narrow and standard laptop sizes');
     await page.getByRole('textbox', { name: 'Search notes', exact: true }).fill('sketchbooks');
     assert.equal(await page.locator('.xx-note-row').count(), 1);
     await page.getByRole('button', { name: 'Clear note search', exact: true }).click();
@@ -248,7 +268,7 @@ async function main() {
     report.checks.push('Project creation, note-text search and project-scoped memory expose saved notes and checked source references without generated claims');
     await page.getByRole('button', { name: 'Back to notes', exact: false }).first().click();
     await page.setViewportSize({ width: 920, height: 740 });
-    await page.locator('.xx-library-header').getByRole('button', { name: 'New note', exact: true }).evaluate(button => { button.click(); button.click(); });
+    await page.locator('.xx-library-toolbar').getByRole('button', { name: 'New note', exact: true }).evaluate(button => { button.click(); button.click(); });
     const editor = page.getByRole('textbox', { name: 'Live meeting notes', exact: true });
     await editor.waitFor();
     await page.waitForFunction(() => !!window.qaCleanState().job && window.qaCleanState().live.project_id === 'willow');
@@ -257,7 +277,7 @@ async function main() {
     assert.equal(await page.locator('#live-transcript-drawer').isVisible(), false);
     assert.equal(await page.getByRole('button', { name: 'Show transcript', exact: true }).getAttribute('aria-expanded'), 'false');
     assert.equal(await editor.inputValue(), '');
-    report.checks.push('Rapid New note clicks start exactly one synthetic capture and one Trelis20 job, attach a durable meeting and open an empty notes canvas with transcript collapsed');
+    report.checks.push('Rapid New note clicks start exactly one synthetic capture and one Trelis10 job, attach a durable meeting and open an empty notes canvas with transcript collapsed');
     await editor.fill('Workshop notes\n\nPrepare 24 sketchbooks. Maya will confirm the room.');
     await page.waitForFunction(() => window.qaCleanState().live.notes.includes('24 sketchbooks'));
     const firstSaved = await page.evaluate(() => window.qaCleanState().live);
@@ -310,4 +330,5 @@ async function main() {
   }
   console.log(JSON.stringify(report));
 }
-main().catch(error => { console.error(error); process.exitCode = 1; });
+module.exports = { installCleanLiveFixture };
+if (require.main === module) main().catch(error => { console.error(error); process.exitCode = 1; });

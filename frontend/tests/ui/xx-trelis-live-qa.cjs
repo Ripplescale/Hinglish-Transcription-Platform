@@ -59,7 +59,7 @@ async function installLiveFixture(page) {
         if (!['live-final', 'fallback'].includes(args.workflowRole)) throw Error('Unexpected synthetic role');
         if (jobs.has(args.workflowRole)) throw Error('Duplicate synthetic job');
         const job = { job_id: `qa-${args.workflowRole}`, session_dir: capture.session_dir, capture_session_id: capture.session_id,
-          profile: args.profile, workflow_role: args.workflowRole, state: 'running', phase: args.workflowRole === 'live-final' ? 'loading_model' : 'transcribing', segments: [] };
+          profile: args.profile, final_profile: args.finalProfile, workflow_role: args.workflowRole, state: 'running', phase: args.workflowRole === 'live-final' ? 'loading_model' : 'transcribing', segments: [] };
         jobs.set(args.workflowRole, job); return structuredClone(job);
       }
       if (command === 'list_local_transcription_jobs') return structuredClone([...jobs.values()]);
@@ -71,7 +71,7 @@ async function installLiveFixture(page) {
         const layer = args.primary ? 'primary' : 'fallback';
         imported[layer] = job.segments.map(segment => ({ ...segment, audio_start_time: segment.start_seconds, audio_end_time: segment.end_seconds, timestamp: '15:00' }));
         const workspace = window.qaWorkspace(args.primary ? undefined : 'qa-draft');
-        workspace.source_job_id = job.job_id; workspace.workflow_role = job.workflow_role;
+        workspace.source_job_id = job.job_id; workspace.workflow_role = job.workflow_role; workspace.profile = job.profile;
         return { meeting_id: args.primary ? 'qa-meeting' : 'qa-draft' };
       }
       if (command === 'api_get_meeting_transcripts') {
@@ -105,37 +105,58 @@ async function main() {
   });
   await new Promise(resolve => server.listen(3126, '127.0.0.1', resolve));
   let browser, page;
-  const report = { synthetic_ipc: true, native_execution: false, actual_recording: false, loading_notice_checked: checkWarmup, checks: [], page_errors: [], screenshots: [] };
+  const report = { synthetic_ipc: true, native_execution: false, actual_recording: false, loading_notice_checked: checkWarmup, checks: [], page_errors: [], console_errors: [], screenshots: [] };
   const screenshot = async name => { await page.screenshot({ path: path.join(output, name), fullPage: true }); report.screenshots.push(name); };
   try {
     browser = await chromium.launch({ channel: 'msedge', headless: true });
     page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     page.on('pageerror', error => report.page_errors.push(error.message));
+    page.on('console', message => { if (message.type() === 'error') report.console_errors.push(message.text()); });
     await installLiveFixture(page);
-    await page.goto('http://127.0.0.1:3126/');
+    await page.goto('http://127.0.0.1:3126/settings');
     await page.waitForFunction(() => window.qaCalls.some(call => call.command === 'get_active_capture'));
-    await page.locator('summary').filter({ hasText: /^Recording options/ }).click();
+    await page.getByRole('tab', { name: 'Transcription', exact: true }).click();
     await page.getByText('Trelis live transcript', { exact: false }).first().waitFor();
     assert.equal(await page.getByLabel('Local transcription profile').count(), 0);
+    assert.equal(await page.getByLabel('Trelis chunk length').inputValue(), 'trelis-10');
+    assert.equal(await page.getByLabel('Trelis chunk length').locator('option').count(), 3);
+    for (const profile of ['trelis-5', 'trelis-20', 'trelis-10']) {
+      await page.getByLabel('Trelis chunk length').selectOption(profile);
+      assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('sttapp.local-workflow.v1')).preferences.profile), profile);
+    }
+    await page.reload();
+    await page.waitForFunction(() => window.qaCalls.some(call => call.command === 'get_active_capture'));
+    await page.getByRole('tab', { name: 'Transcription', exact: true }).click();
+    assert.equal(await page.getByLabel('Trelis chunk length').inputValue(), 'trelis-10');
+    await screenshot('chunk-selector-1440x900.png');
+    report.checks.push('5,10,20-second chunk choices persist; new settings default to10 and survive reload');
+    await page.goto('http://127.0.0.1:3126/');
+    await page.waitForFunction(() => window.qaCalls.some(call => call.command === 'get_active_capture'));
     await page.evaluate(() => window.qaStart());
     await page.waitForFunction(() => window.qaLiveState().jobs.length === 1);
     assert.equal((await page.evaluate(() => window.qaLiveState().jobs[0])).workflow_role, 'live-final');
+    assert.equal((await page.evaluate(() => window.qaLiveState().jobs[0])).profile, 'trelis-10');
+    await page.getByLabel('Recording options', { exact: true }).click();
+    assert.equal(await page.getByLabel('Trelis chunk length').isDisabled(), true);
     if (checkWarmup) {
       await page.getByText('Loading Trelis. Your audio is being saved while the model gets ready; the first transcript can take about a minute.', { exact: true }).waitFor();
       await screenshot('model-loading-1440x900.png');
       report.checks.push('Model-loading status explains startup delay while preserving independent recording');
     }
     await page.evaluate(() => window.qaSetJob('live-final', 'running', 2));
-    await page.getByText('The conversation so far', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Show transcript', exact: true }).click();
+    await page.getByText('Trelis · 10-second windows plus processing · original Hindi + English script', { exact: true }).waitFor();
     await page.getByRole('button', { name: 'Use Apex fallback', exact: true }).waitFor();
     await screenshot('live-trelis-1440x900.png');
-    report.checks.push('One primary Trelis20 live job starts from a synthetic recording event and displays mixed-script text');
+    await page.getByText('Trelis · 10-second windows plus processing · original Hindi + English script', { exact: true }).waitFor();
+    report.checks.push('One primary Trelis10 live job starts from a synthetic recording event and displays its chosen duration and mixed-script text');
     await page.getByRole('button', { name: 'Use Apex fallback', exact: true }).click();
     await page.waitForFunction(() => window.qaCalls.some(call => call.command === 'stop_local_transcription'));
     await page.waitForTimeout(3200);
     assert.equal((await page.evaluate(() => window.qaLiveState().jobs)).length, 1);
     await page.evaluate(() => window.qaSetJob('live-final', 'stopped', 3));
     await page.waitForFunction(() => window.qaLiveState().jobs.length === 2);
+    assert.equal((await page.evaluate(() => window.qaLiveState().jobs.find(job => job.workflow_role === 'fallback'))).final_profile, 'trelis-10');
     assert.equal((await page.evaluate(() => window.qaLiveState().imported.primary)).length, 3);
     await page.evaluate(() => window.qaSetJob('fallback', 'running', 2));
     await page.getByText('Welcome back. Aaj Project Willow ki workshop plan karte hain.', { exact: true }).waitFor();
@@ -143,14 +164,23 @@ async function main() {
     await page.evaluate(() => window.qaStop());
     await page.waitForURL('**/meeting-details?id=qa-meeting');
     await page.getByRole('heading', { name: 'Project Willow · Friday catch-up', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Show transcript', exact: true }).click();
     await page.evaluate(() => window.qaSetJob('fallback', 'complete', 2));
     await page.getByRole('navigation', { name: 'Transcript versions' }).getByRole('button', { name: 'Apex fallback', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Tools', exact: true }).click();
     await page.getByText('Transcription & versions', { exact: true }).click();
+    assert.equal(await page.getByLabel('Trelis chunk length').inputValue(), 'trelis-10');
+    await page.getByLabel('Trelis chunk length').selectOption('trelis-5');
+    await page.getByLabel('Local transcription profile').selectOption('apex-20');
+    assert.equal(await page.getByLabel('Trelis chunk length').count(), 0);
+    await page.getByLabel('Local transcription profile').selectOption('trelis-5');
+    assert.equal(await page.getByLabel('Trelis chunk length').inputValue(), 'trelis-5');
+    assert.equal((await page.evaluate(() => window.qaLiveState().jobs.find(job => job.workflow_role === 'live-final'))).profile, 'trelis-10');
+    report.checks.push('Library reprocessing model and chunk choices stay independent of existing transcript and rememberTrelis5 after Apex selection');
     await page.getByRole('button', { name: 'Retry Trelis', exact: true }).click();
     await page.waitForFunction(() => window.qaCalls.some(call => call.command === 'resume_local_transcription'));
     await page.keyboard.press('Escape');
-    await page.getByText('Finishing transcript', { exact: true }).first().waitFor();
+    await page.getByRole('navigation', { name: 'Transcript versions' }).getByRole('button', { name: /^Finishing transcript/ }).waitFor();
     await page.evaluate(() => window.qaSetJob('live-final', 'complete', 5));
     await page.getByRole('navigation', { name: 'Transcript versions' }).getByRole('button', { name: 'Final transcript', exact: true }).waitFor();
     report.checks.push('Stopping capture starts no second pass; explicit retry resumes original Trelis, labelled Final only after completion');
@@ -166,7 +196,8 @@ async function main() {
     await page.setViewportSize({ width: 1440, height: 900 });
     const primaryBefore = await page.evaluate(() => window.qaWorkspace());
     await page.getByRole('navigation', { name: 'Transcript versions' }).getByRole('button', { name: 'Apex fallback', exact: true }).click();
-    await page.getByRole('heading', { name: 'Notes for this fallback', exact: true }).waitFor();
+    await page.getByText('Notes for this fallback', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Show transcript', exact: true }).click();
     await page.getByRole('textbox', { name: 'Meeting notes', exact: true }).fill('A fictional note only for the fallback version.');
     await page.getByRole('button', { name: 'Edit', exact: true }).first().click();
     await page.getByRole('textbox', { name: 'Correct transcript text' }).fill('A corrected fictional fallback line.');

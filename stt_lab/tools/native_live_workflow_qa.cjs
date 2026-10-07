@@ -61,8 +61,8 @@ async function main() {
     assert.equal(pathKey(originalConfig.synthetic_data_root), pathKey(root));
     checked('Isolated fictional root confirmed through native saved-audio lookup; no capture devices');
 
-    await assert.rejects(() => invoke('start_local_transcription', { ...startArgs('live-final'), profile: 'apex-20' }), /Use Trelis 20s/);
-    await assert.rejects(() => invoke('start_local_transcription', { ...startArgs('fallback'), profile: 'trelis-20' }), /Use Trelis 20s/);
+    await assert.rejects(() => invoke('start_local_transcription', { ...startArgs('live-final'), profile: 'apex-20' }), /Use Trelis 5s, 10s or 20s/);
+    await assert.rejects(() => invoke('start_local_transcription', { ...startArgs('fallback'), profile: 'trelis-20' }), /Use Trelis 5s, 10s or 20s/);
     await assert.rejects(() => invoke('start_local_transcription', startArgs('final')), /Finalize or recover/);
     const [first, duplicate] = await Promise.all([
       invoke('start_local_transcription', startArgs('live-final')),

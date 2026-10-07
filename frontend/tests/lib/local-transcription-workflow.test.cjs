@@ -8,7 +8,7 @@ const source = fs.readFileSync(path.join(__dirname, '../../src/lib/local-transcr
 const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS } });
 const context = { exports: {}, require };
 vm.runInNewContext(compiled.outputText, context);
-const { LocalWorkflow, readPreferences, pathKey } = context.exports;
+const { LocalWorkflow, readPreferences, pathKey, profileLabel } = context.exports;
 const clone = value => JSON.parse(JSON.stringify(value));
 const capture = { session_id: 'session-one', session_dir: 'C:\\STTApp\\recordings\\one' };
 const second = { session_id: 'session-two', session_dir: 'C:\\STTApp\\recordings\\two' };
@@ -31,7 +31,7 @@ function fixture(previous) {
         if (startFailures.has(args.workflowRole)) throw new Error('synthetic model unavailable');
         let job = args.workflowRole && [...jobs.values()].find(item => item.session_dir === args.sessionDir && item.workflow_role === args.workflowRole);
         if (!job) {
-          job = { job_id: `job-${++nextJob}`, session_dir: args.sessionDir, profile: args.profile, workflow_role: args.workflowRole, state: 'running', segments: [] };
+          job = { job_id: `job-${++nextJob}`, session_dir: args.sessionDir, profile: args.profile, final_profile: args.finalProfile, workflow_role: args.workflowRole, state: 'running', segments: [] };
           jobs.set(job.job_id, job);
         }
         if (startGate) await startGate;
@@ -107,7 +107,7 @@ async function startFinal(f) {
 
 test('new recording defaults migrate profile/timing while preserving language and legacy run settings', () => {
   const preferences = readPreferences({ profile: 'trelis-15', timing: 'after-recording', languageMode: 'english' });
-  assert.equal(preferences.profile, 'trelis-20'); assert.equal(preferences.timing, 'during-recording'); assert.equal(preferences.languageMode, 'english');
+  assert.equal(preferences.profile, 'trelis-10'); assert.equal(preferences.timing, 'during-recording'); assert.equal(preferences.languageMode, 'english');
   assert.equal(pathKey('\\\\?\\C:\\STTApp\\recordings\\one'), pathKey(capture.session_dir));
   const old = { capture, recording: false, primary: true, preferences: { profile: 'trelis-20', timing: 'after-recording', languageMode: 'hinglish' } };
   const f = fixture({ preferences, runs: [old] });
@@ -330,7 +330,7 @@ test('manual versions cannot hijack a paired capture when a duplicate stop arriv
 test('new calls start a single primary Trelis live job and drain that same job after stop', async () => {
   const f = fixture(); await Promise.all([f.workflow.captureStarted(capture), f.workflow.captureStarted(capture)]);
   assert.equal(f.runs().length, 1); const live = f.live(), id = live.job.job_id;
-  assert.equal(live.primary, true); assert.equal(live.preferences.profile, 'trelis-20');
+  assert.equal(live.primary, true); assert.equal(live.preferences.profile, 'trelis-10');
   assert.equal(live.preferences.timing, 'during-recording'); assert.equal(f.count('start_local_transcription'), 1);
   f.status(live, { segments: [segment()] }); await f.workflow.tick();
   assert.equal(live.transcriptMeetingId, live.meetingId);
@@ -482,4 +482,59 @@ test('rediscovery does not pause Trelis that was explicitly resumed after fallba
   assert.equal(f.live().job.state, 'running'); assert.notEqual(f.live().fallbackRequested, true);
   assert.notEqual(f.live().pausedByUser, true); assert.equal(f.count('stop_local_transcription'), stopCount);
   assert.equal(f.count('start_local_transcription'), 2); assert.equal(f.count('resume_local_transcription'), 1);
+});
+
+test('chunk preferences default to 10 and persist each valid Trelis duration', () => {
+  assert.equal(readPreferences().profile, 'trelis-10');
+  assert.equal(readPreferences({ profile: 'apex-20' }).profile, 'trelis-10');
+  for (const seconds of [5, 10, 20]) {
+    const profile = `trelis-${seconds}`;
+    assert.equal(readPreferences({ profile }).profile, profile);
+    assert.equal(profileLabel(profile), `Trelis · ${seconds}s`);
+    const f = fixture(); f.workflow.setPreferences({ profile, languageMode: 'english', timing: 'during-recording' });
+    f.reload(); assert.equal(f.workflow.state.preferences.profile, profile);
+  }
+});
+
+test('chosen chunk size stays with the live job after preferences change, fallback and resume', async () => {
+  for (const profile of ['trelis-5', 'trelis-10', 'trelis-20']) {
+    const f = fixture({ preferences: { profile } }); await f.workflow.captureStarted(capture);
+    const id = f.live().job.job_id; assert.equal(f.live().job.profile, profile);
+    f.workflow.setPreferences({ profile: 'trelis-20', languageMode: 'hinglish', timing: 'during-recording' });
+    await f.workflow.useApexFallback(f.live()); f.status(f.live(), { state: 'stopped' }); await f.workflow.tick();
+    assert.equal(f.fallback().job.profile, 'apex-20'); assert.equal(f.fallback().job.final_profile, profile);
+    assert.equal(f.calls.find(call => call.args.workflowRole === 'fallback').args.finalProfile, profile);
+    f.status(f.fallback(), { state: 'complete' }); await f.workflow.tick();
+    await f.workflow.retry(f.live()); await f.workflow.captureStopped(capture);
+    assert.equal(f.live().job.job_id, id); assert.equal(f.live().job.profile, profile);
+  }
+});
+
+test('manual versions preserve all chosen Trelis durations without rewriting historical20', async () => {
+  const f = fixture();
+  for (const seconds of [5, 10, 20]) {
+    const job = { job_id: `manual-${seconds}`, session_dir: capture.session_dir, profile: `trelis-${seconds}`, state: 'complete', segments: [segment()] };
+    f.jobs.set(job.job_id, job); await f.workflow.adopt(job, 'base-meeting');
+    assert.equal(f.workflow.state.runs.find(run => run.job.job_id === job.job_id).preferences.profile, job.profile);
+  }
+});
+
+test('fallback-only native recovery restores selected final duration while old fallback remains20', async () => {
+  for (const finalProfile of ['trelis-5', 'trelis-10', 'trelis-20', undefined]) {
+    const f = fixture({ preferences: { profile: 'trelis-10' } });
+    const job = { job_id: 'fallback-only', session_dir: capture.session_dir, capture_session_id: capture.session_id,
+      profile: 'apex-20', final_profile: finalProfile, workflow_role: 'fallback', state: 'complete', segments: [] };
+    f.jobs.set(job.job_id, job); await f.workflow.refreshAfterReload(capture);
+    assert.equal(f.live().preferences.profile, finalProfile ?? 'trelis-20');
+    assert.equal(f.live().pausedByUser, true); assert.equal(f.count('start_local_transcription'), 0);
+    await f.workflow.retry(f.live()); assert.equal(f.live().job.profile, finalProfile ?? 'trelis-20');
+  }
+});
+
+test('legacy dual-pass creation keeps a saved Trelis final duration and Apex draft duration', async () => {
+  const f = fixture({ preferences: { profile: 'trelis-5' }, runs: [{ capture, role: 'live-draft', recording: true, primary: false,
+    preferences: { profile: 'apex-20', languageMode: 'hinglish', timing: 'during-recording' }, finalProfile: 'trelis-10' }] });
+  await f.workflow.captureStarted(capture);
+  assert.equal(f.draft().preferences.profile, 'apex-20'); assert.equal(f.final().preferences.profile, 'trelis-10');
+  await f.workflow.captureStopped(capture); await finishDraft(f); assert.equal(f.final().job.profile, 'trelis-10');
 });

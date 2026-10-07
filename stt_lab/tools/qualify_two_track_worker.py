@@ -262,8 +262,8 @@ def pause_is_due(elapsed, pause_at, observed_segments, pause_after_segments=0):
 
 def run(output, run_name, profile='trelis-20', max_seconds=900, pause_at=None,
         resume_after=2.0, baseline=None, pause_after_segments=0):
-    if profile not in ('apex-20', 'trelis-20'):
-        raise ValueError('Only the selected 20-second profiles are supported')
+    if profile not in ('apex-20', 'trelis-5', 'trelis-10', 'trelis-20'):
+        raise ValueError('Choose Apex 20s or Trelis 5s, 10s or 20s')
     if not run_name or not run_name.replace('-', '').replace('_', '').isalnum():
         raise ValueError('Unsafe run name')
     manifest, cfg, sources = load_input(output)
@@ -417,7 +417,7 @@ def main():
     test = sub.add_parser('run')
     test.add_argument('--output', type=Path, required=True)
     test.add_argument('--run-name', required=True)
-    test.add_argument('--profile', choices=('apex-20', 'trelis-20'), default='trelis-20')
+    test.add_argument('--profile', choices=('apex-20', 'trelis-5', 'trelis-10', 'trelis-20'), default='trelis-10')
     test.add_argument('--max-seconds', type=int, default=900)
     test.add_argument('--pause-at', type=float)
     test.add_argument('--pause-after-segments', type=int, default=0)

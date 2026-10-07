@@ -232,13 +232,23 @@ pub fn set_speaker_metadata(id: &str, job: &str, result: &serde_json::Value) -> 
 
 pub fn set_job_metadata(id: &str, parent: &str, job: &str, status: &serde_json::Value) -> Result<(),String> {
     let _guard=STORE_LOCK.lock().map_err(|e|e.to_string())?;
-    let dir=object_dir(&data_root()?,"workspaces",id)?.join("job-metadata");
+    set_job_metadata_at(&data_root()?,id,parent,job,status)
+}
+
+fn set_job_metadata_at(root: &Path, id: &str, parent: &str, job: &str, status: &serde_json::Value) -> Result<(),String> {
+    let dir=object_dir(root,"workspaces",id)?.join("job-metadata");
     let mut value=latest_revision(&dir)?.unwrap_or_else(||serde_json::json!({"version":1,"revision":0}));
     let mut metadata=serde_json::Map::new();
     for segment in status["segments"].as_array().ok_or("Missing segments")? {
         if let Some(sid)=segment["id"].as_str() {
-            metadata.insert(sid.into(),serde_json::json!({"source_track":segment["source_track"],"timestamp_kind":"audio_window",
-                "quality_flags":segment["quality_flags"],"alternative":segment["alternative"]}));
+            let mut item=serde_json::json!({"source_track":segment["source_track"],"timestamp_kind":"audio_window",
+                "quality_flags":segment["quality_flags"],"alternative":segment["alternative"]});
+            if segment["alternative"]["promoted"] == true {
+                if let Some(original)=segment["recognition_original"]["text"].as_str() {
+                    item["original_recognition_text"]=original.into();
+                }
+            }
+            metadata.insert(sid.into(),item);
         }
     }
     if value["source_job_id"]==job && value["segment_metadata"]==serde_json::Value::Object(metadata.clone()) { return Ok(()); }
@@ -440,6 +450,36 @@ mod tests {
         assert_eq!(loaded["notes"],"user draft");
         assert_eq!(loaded["segment_metadata"]["chunk1"]["source_track"],"system");
         assert!(append_revision(&dir,1,serde_json::json!({"notes":"stale edit"})).is_err());
+    }
+    #[test]
+    fn promoted_retry_metadata_keeps_original_without_revising_notes_or_legacy_jobs() {
+        let root=tempfile::tempdir().unwrap();
+        let dir=root.path().join("workspaces").join("meeting-one");
+        let saved=append_revision(&dir,0,serde_json::json!({"notes":"user notes","corrections":[]})).unwrap();
+        let status=serde_json::json!({"profile":"trelis-10","workflow_role":"live-final","segments":[{
+            "id":"chunk-one","text":"recovered speech","source_track":"system",
+            "quality_flags":["retry_applied","needs_review"],
+            "alternative":{"text":"recovered speech","promoted":true},
+            "recognition_original":{"text":"जब जब जब जब जब जब जब जब जब जब जब जब"}
+        }]});
+        set_job_metadata_at(root.path(),"meeting-one","meeting-one","job-one",&status).unwrap();
+        let loaded=with_job_metadata(&dir,saved.clone()).unwrap();
+        assert_eq!(loaded["notes"],"user notes");
+        assert_eq!(loaded["revision"],1);
+        assert_eq!(loaded["segment_metadata"]["chunk-one"]["original_recognition_text"],status["segments"][0]["recognition_original"]["text"]);
+        assert_eq!(loaded["segment_metadata"]["chunk-one"]["alternative"]["promoted"],true);
+        let metadata_dir=dir.join("job-metadata");
+        set_job_metadata_at(root.path(),"meeting-one","meeting-one","job-one",&status).unwrap();
+        assert_eq!(latest_revision(&metadata_dir).unwrap().unwrap()["revision"],1);
+        assert_eq!(latest_revision(&dir).unwrap().unwrap(),saved);
+
+        let legacy=serde_json::json!({"profile":"trelis-20","segments":[{"id":"old-chunk",
+            "source_track":"microphone","quality_flags":["retry_available"],
+            "alternative":{"text":"comparison only","requires_review":true}}]});
+        set_job_metadata_at(root.path(),"meeting-two","meeting-two","old-job",&legacy).unwrap();
+        let old=latest_revision(&root.path().join("workspaces/meeting-two/job-metadata")).unwrap().unwrap();
+        assert_eq!(old["segment_metadata"]["old-chunk"]["alternative"],legacy["segments"][0]["alternative"]);
+        assert!(old["segment_metadata"]["old-chunk"].get("original_recognition_text").is_none());
     }
     #[test]
     fn verified_quantity_requires_evidence_context_and_unit() {

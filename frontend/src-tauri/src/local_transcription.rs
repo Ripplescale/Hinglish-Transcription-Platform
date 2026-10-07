@@ -9,8 +9,11 @@ static JOB_START_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 pub fn profile_parts(profile: &str) -> Result<(&'static str, u32), String> {
     match profile {
-        "apex-20" => Ok(("apex",20)), "trelis-20" => Ok(("trelis",20)),
-        _ => Err("Choose Apex 20s or Trelis 20s".into()),
+        "apex-20" => Ok(("apex",20)),
+        "trelis-5" => Ok(("trelis",5)),
+        "trelis-10" => Ok(("trelis",10)),
+        "trelis-20" => Ok(("trelis",20)),
+        _ => Err("Choose Trelis 5s, 10s or 20s, or Apex 20s".into()),
     }
 }
 
@@ -43,20 +46,53 @@ fn path_key(path: &str) -> String {
 #[tauri::command]
 pub fn get_local_stt_profiles() -> Result<Vec<Value>, String> {
     let config = config_path().and_then(|p| read(&p)).ok();
-    Ok(["trelis-20","apex-20"].iter().map(|id| {
+    Ok(local_stt_profiles(config.as_ref()))
+}
+
+fn local_stt_profiles(config: Option<&Value>) -> Vec<Value> {
+    // The declared UI choices stay fixed; an older installed worker can offer
+    // only the subset admitted by its own immutable registry.
+    let registry = config.and_then(runtime_registry);
+    ["trelis-5","trelis-10","trelis-20","apex-20"].iter().map(|id| {
         let (model,seconds) = profile_parts(id).unwrap();
-        let accelerated = config.as_ref().map(|c| c["models"][model]["backend"] == "openvino"
+        let accelerated = config.map(|c| c["models"][model]["backend"] == "openvino"
             && c["models"][model]["device"] == "GPU"
             && c["models"][model]["export_path"].as_str().map(|p|Path::new(p).join("conversion-provenance.json").is_file()).unwrap_or(false)).unwrap_or(false);
-        let available = config.as_ref().map(|c| ["python_executable","worker_script","registry_path"].iter()
+        let configured = config.map(|c| ["python_executable","worker_script","registry_path"].iter()
             .all(|key| c[key].as_str().map(|p| Path::new(p).is_file()).unwrap_or(false))
             && c["models"][model]["artifact_path"].as_str().map(|p| Path::new(p).exists()).unwrap_or(false)).unwrap_or(false);
+        let supported = registry_supports_profile(registry.as_ref(), id);
+        let available = configured && supported;
+        let model_name = if model=="trelis" {"Trelis"} else {"Apex"};
+        let reason = if !configured {"Local runtime needs setup (STTApp/runtime.json)".to_owned()}
+            else if !supported {format!("Local worker needs setup or an update for {model_name} {seconds}s. Update the local STT runtime.")}
+            else if model=="apex" {"Available as a separate fallback transcript".to_owned()}
+            else if accelerated {format!("Local GPU runtime configured; {seconds}-second audio windows plus processing time")}
+            else {"GPU setup is needed for Trelis live transcription; Apex fallback is available".to_owned()};
         json!({"id":id,"model":model,"chunk_seconds":seconds,"available":available,
-            "reason":if !available {"Local runtime needs setup (STTApp/runtime.json)"} else if model=="apex" {"Available as a separate fallback transcript"} else if accelerated {"Local GPU runtime configured; 20-second audio windows plus processing time"} else {"GPU setup is needed for Trelis live transcription; Apex fallback is available"},
+            "reason":reason,
             "language_modes":["hinglish","english"],"live_qualified":false,
-            "backend":config.as_ref().map(|c|c["models"][model]["backend"].clone()),
+            "backend":config.map(|c|c["models"][model]["backend"].clone()),
             "live_replay_supported":model=="apex" || accelerated,"recommended_timing":if model=="apex" || accelerated {"during-recording"} else {"after-recording"}})
-    }).collect())
+    }).collect()
+}
+
+fn runtime_registry(config: &Value) -> Option<Value> {
+    config["registry_path"].as_str().and_then(|path| read(Path::new(path)).ok())
+}
+
+fn registry_supports_profile(registry: Option<&Value>, profile: &str) -> bool {
+    let (model, seconds) = match profile_parts(profile) { Ok(parts) => parts, Err(_) => return false };
+    registry.and_then(|registry| registry["application_profiles"][model].as_array())
+        .map(|durations| durations.iter().any(|duration| duration.as_u64() == Some(seconds.into())))
+        .unwrap_or(false)
+}
+
+fn require_runtime_profile(config: &Value, profile: &str) -> Result<(), String> {
+    let (model, seconds) = profile_parts(profile)?;
+    if registry_supports_profile(runtime_registry(config).as_ref(), profile) { return Ok(()); }
+    let model_name = if model=="trelis" {"Trelis"} else {"Apex"};
+    Err(format!("The local worker needs setup or an update for {model_name} {seconds}s. Update the local STT runtime before starting this chunk size; saved recordings and existing jobs are preserved."))
 }
 
 fn capture_session(directory: &str) -> Result<(PathBuf, Value), String> {
@@ -252,10 +288,11 @@ pub fn retry_speaker_identification(job_id: String) -> Result<Value,String> {
 }
 
 #[tauri::command]
-pub fn start_local_transcription(session_dir: String, profile: String, language_mode: String, project_id: Option<String>, workflow_role: Option<String>) -> Result<Value, String> {
+pub fn start_local_transcription(session_dir: String, profile: String, language_mode: String, project_id: Option<String>, workflow_role: Option<String>, final_profile: Option<String>) -> Result<Value, String> {
     let _start_guard = JOB_START_LOCK.lock().map_err(|e| e.to_string())?;
     profile_parts(&profile)?;
     validate_workflow_role(workflow_role.as_deref(), &profile)?;
+    validate_final_profile(final_profile.as_deref())?;
     if !["hinglish","english"].contains(&language_mode.as_str()) { return Err("Choose a declared Hinglish or English decoder profile".into()); }
     if let Some(id) = &project_id { valid_id(id)?; }
     let (session,capture) = capture_session(&session_dir)?;
@@ -275,11 +312,14 @@ pub fn start_local_transcription(session_dir: String, profile: String, language_
             }
         }
     }
+    // Check only new jobs against today's worker declaration. Existing jobs
+    // resume with their original runtime snapshot rather than this registry.
+    require_runtime_profile(&read(&config_path()?)?, &profile)?;
     let job_id = uuid::Uuid::new_v4().to_string();
     let dir = job_dir(&job_id)?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let request = json!({"version":1,"job_id":job_id,"session_dir":session.to_string_lossy(),"profile":profile,
-        "language_mode":language_mode,"project_id":project_id,"workflow_role":workflow_role,
+        "language_mode":language_mode,"project_id":project_id,"workflow_role":workflow_role,"final_profile":final_profile,
         "capture_session_id":capture["session_id"],"created_at":chrono::Utc::now().to_rfc3339()});
     fs::write(dir.join("request.json"),serde_json::to_vec_pretty(&request).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     launch(&job_id)?;
@@ -307,13 +347,21 @@ fn capture_ready_for_final(session: &Path) -> Result<bool, String> {
 }
 
 fn validate_workflow_role(role: Option<&str>, profile: &str) -> Result<(), String> {
+    let (model, _) = profile_parts(profile)?;
     match role {
         None => Ok(()),
         Some("live-draft") if profile == "apex-20" => Ok(()),
-        Some("final") if profile == "trelis-20" => Ok(()),
-        Some("live-final") if profile == "trelis-20" => Ok(()),
+        Some("final") | Some("live-final") if model == "trelis" => Ok(()),
         Some("fallback") if profile == "apex-20" => Ok(()),
-        _ => Err("Use Trelis 20s for the live transcript or Apex 20s for its fallback".into()),
+        _ => Err("Use Trelis 5s, 10s or 20s for the transcript or Apex 20s for its fallback".into()),
+    }
+}
+
+fn validate_final_profile(profile: Option<&str>) -> Result<(), String> {
+    match profile {
+        None => Ok(()),
+        Some(profile) if profile_parts(profile).map(|(model, _)| model == "trelis").unwrap_or(false) => Ok(()),
+        _ => Err("Choose Trelis 5s, 10s or 20s for the final transcript".into()),
     }
 }
 
@@ -357,11 +405,14 @@ pub fn get_local_transcription_status(job_id: String) -> Result<Value, String> {
         result["error"] = "Worker exited or the application restarted. Saved audio and completed results remain available; resume the job.".into();
     }
     project_worker_lifecycle(&mut result, exited);
-    result["workflow_role"] = request["workflow_role"].clone();
-    result["capture_session_id"] = request["capture_session_id"].clone();
-    result["language_mode"] = request["language_mode"].clone();
-    result["created_at"] = request["created_at"].clone();
+    project_request_metadata(&mut result, &request);
     Ok(result)
+}
+
+fn project_request_metadata(status: &mut Value, request: &Value) {
+    for key in ["workflow_role", "capture_session_id", "language_mode", "created_at", "final_profile"] {
+        status[key] = request[key].clone();
+    }
 }
 
 fn project_worker_lifecycle(status: &mut Value, exited: bool) {
@@ -552,6 +603,9 @@ mod tests {
             fs::write(&path, b"synthetic fixture; never executed").unwrap();
             config[key] = json!(path);
         }
+        fs::write(config["registry_path"].as_str().unwrap(), serde_json::to_vec(&json!({
+            "application_profiles":{"apex":[20],"trelis":[5,10,20]}
+        })).unwrap()).unwrap();
         config
     }
     #[test] fn asr_runtime_snapshot_keeps_old_runtime_after_global_change() {
@@ -632,14 +686,23 @@ mod tests {
     }
     #[test] fn automatic_roles_do_not_admit_swapped_models() {
         assert!(validate_workflow_role(Some("live-draft"), "apex-20").is_ok());
-        assert!(validate_workflow_role(Some("final"), "trelis-20").is_ok());
-        assert!(validate_workflow_role(Some("live-final"), "trelis-20").is_ok());
         assert!(validate_workflow_role(Some("fallback"), "apex-20").is_ok());
         assert!(validate_workflow_role(Some("live-final"), "apex-20").is_err());
-        assert!(validate_workflow_role(Some("fallback"), "trelis-20").is_err());
         assert!(validate_workflow_role(Some("final"), "apex-20").is_err());
-        assert!(validate_workflow_role(Some("live-draft"), "trelis-20").is_err());
         assert!(validate_workflow_role(None, "apex-20").is_ok());
+        for profile in ["trelis-5", "trelis-10", "trelis-20"] {
+            assert!(validate_workflow_role(Some("final"), profile).is_ok());
+            assert!(validate_workflow_role(Some("live-final"), profile).is_ok());
+            assert!(validate_workflow_role(Some("fallback"), profile).is_err());
+            assert!(validate_workflow_role(Some("live-draft"), profile).is_err());
+            assert!(validate_workflow_role(None, profile).is_ok());
+            assert!(validate_workflow_role(Some("unknown"), profile).is_err());
+        }
+        for profile in ["trelis-0", "trelis-15", "trelis-30", "apex-5", "apex-10", "unknown"] {
+            for role in [None, Some("final"), Some("live-final"), Some("fallback"), Some("live-draft")] {
+                assert!(validate_workflow_role(role, profile).is_err());
+            }
+        }
     }
     #[test] fn final_requires_committed_completion_or_matching_recovery() {
         use sha2::{Digest, Sha256};
@@ -660,9 +723,126 @@ mod tests {
         assert!(!capture_ready_for_final(root.path()).unwrap());
     }
     #[test] fn only_requested_profiles_are_admitted() {
-        for retired in ["trelis-15","trelis-30","apex-15","apex-30"] { assert!(profile_parts(retired).is_err()); }
+        for invalid in ["trelis-0", "trelis-1", "trelis-15", "trelis-30", "trelis-05", "trelis-5.0", "apex-5", "apex-10", "apex-15", "apex-30", "unknown", ""] {
+            assert!(profile_parts(invalid).is_err(), "Unexpected profile admitted: {invalid}");
+        }
+        for seconds in [5, 10, 20] {
+            assert_eq!(profile_parts(&format!("trelis-{seconds}")).unwrap(),("trelis",seconds));
+        }
+        // Stored pre-choice transcripts keep the original profile identity.
         assert_eq!(profile_parts("trelis-20").unwrap(),("trelis",20));
         assert_eq!(profile_parts("apex-20").unwrap(),("apex",20));
+    }
+    #[test] fn final_profile_metadata_admits_only_declared_trelis_profiles() {
+        assert!(validate_final_profile(None).is_ok());
+        for profile in ["trelis-5", "trelis-10", "trelis-20"] {
+            assert!(validate_final_profile(Some(profile)).is_ok());
+        }
+        for profile in ["apex-20", "trelis-0", "trelis-15", "trelis-30", "unknown", ""] {
+            assert!(validate_final_profile(Some(profile)).is_err());
+        }
+    }
+    #[test] fn restored_job_preserves_final_profile_metadata_and_legacy_absence() {
+        for profile in ["trelis-5", "trelis-10", "trelis-20"] {
+            let request = json!({"profile":"apex-20","workflow_role":"fallback", "final_profile":profile,
+                "capture_session_id":"capture", "language_mode":"hinglish", "created_at":"2026-10-07"});
+            let mut status = json!({"profile":"apex-20", "state":"complete", "segments":[{"text":"preserved"}]});
+            project_request_metadata(&mut status, &request);
+            assert_eq!(status["final_profile"], profile);
+            assert_eq!(status["workflow_role"], "fallback");
+            assert_eq!(status["profile"], "apex-20");
+            assert_eq!(status["state"], "complete");
+            assert_eq!(status["segments"][0]["text"], "preserved");
+        }
+        let mut legacy = json!({"profile":"apex-20"});
+        project_request_metadata(&mut legacy, &json!({"profile":"apex-20", "workflow_role":"fallback"}));
+        assert!(legacy["final_profile"].is_null());
+        assert_eq!(legacy["profile"], "apex-20");
+    }
+    #[test] fn profile_list_shares_runtime_availability_and_reports_each_duration() {
+        let missing = local_stt_profiles(None);
+        assert_eq!(missing.len(), 4);
+        assert!(missing.iter().all(|profile| profile["available"] == false));
+        let root = tempfile::tempdir().unwrap();
+        let mut config = synthetic_asr_runtime(root.path(), "warm");
+        let artifact = root.path().join("trelis"); fs::create_dir(&artifact).unwrap();
+        let apex = root.path().join("apex"); fs::create_dir(&apex).unwrap();
+        let export = root.path().join("export"); fs::create_dir(&export).unwrap();
+        fs::write(export.join("conversion-provenance.json"), b"{}").unwrap();
+        config["models"] = json!({"trelis":{"backend":"openvino", "device":"GPU", "artifact_path":artifact, "export_path":export},
+            "apex":{"backend":"whisper.cpp", "artifact_path":apex}});
+        let profiles = local_stt_profiles(Some(&config));
+        assert_eq!(profiles.iter().map(|profile| profile["id"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["trelis-5", "trelis-10", "trelis-20", "apex-20"]);
+        for profile in &profiles {
+            let (model, seconds) = profile_parts(profile["id"].as_str().unwrap()).unwrap();
+            assert_eq!(profile["model"], model);
+            assert_eq!(profile["chunk_seconds"], seconds);
+            assert_eq!(profile["available"], true);
+            assert_eq!(profile["language_modes"], json!(["hinglish", "english"]));
+            assert_eq!(profile["live_replay_supported"], true);
+            assert_eq!(profile["live_qualified"], false);
+            assert_eq!(profile["recommended_timing"], "during-recording");
+            if model == "trelis" {
+                assert_eq!(profile["backend"], "openvino");
+                assert!(profile["reason"].as_str().unwrap().contains(&format!("{seconds}-second")));
+            }
+        }
+        config["models"]["trelis"]["device"] = json!("CPU");
+        for profile in local_stt_profiles(Some(&config)).iter().filter(|profile| profile["model"] == "trelis") {
+            assert_eq!(profile["available"], true);
+            assert_eq!(profile["live_replay_supported"], false);
+            assert_eq!(profile["recommended_timing"], "after-recording");
+        }
+        fs::remove_dir(&artifact).unwrap();
+        let absent_trelis = local_stt_profiles(Some(&config));
+        assert!(absent_trelis.iter().filter(|profile| profile["model"] == "trelis").all(|profile| profile["available"] == false));
+        assert_eq!(absent_trelis.iter().find(|profile| profile["model"] == "apex").unwrap()["available"], true);
+        fs::remove_file(config["registry_path"].as_str().unwrap()).unwrap();
+        assert!(local_stt_profiles(Some(&config)).iter().all(|profile| profile["available"] == false));
+    }
+    #[test] fn registry_duration_guard_preserves_legacy_and_admits_modern_choices() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = synthetic_asr_runtime(root.path(), "installed");
+        let artifact = root.path().join("model"); fs::create_dir(&artifact).unwrap();
+        config["models"] = json!({"trelis":{"backend":"openvino", "device":"GPU", "artifact_path":artifact},
+            "apex":{"backend":"whisper.cpp", "artifact_path":artifact}});
+        let registry = Path::new(config["registry_path"].as_str().unwrap());
+        let legacy = json!({"application_profiles":{"apex":[15,20,30],"trelis":[15,20]}});
+        fs::write(registry, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let legacy_choices = local_stt_profiles(Some(&config));
+        assert_eq!(legacy_choices.len(), 4);
+        assert!(legacy_choices.iter().all(|profile| !profile["id"].as_str().unwrap().ends_with("-15")));
+        for profile in ["apex-20", "trelis-20"] {
+            assert!(require_runtime_profile(&config, profile).is_ok());
+            assert_eq!(legacy_choices.iter().find(|choice| choice["id"] == profile).unwrap()["available"], true);
+        }
+        for profile in ["trelis-5", "trelis-10"] {
+            assert!(require_runtime_profile(&config, profile).unwrap_err().contains("Update the local STT runtime"));
+            let choice = legacy_choices.iter().find(|choice| choice["id"] == profile).unwrap();
+            assert_eq!(choice["available"], false);
+            assert!(choice["reason"].as_str().unwrap().contains("update"));
+        }
+        assert!(!registry_supports_profile(Some(&legacy), "trelis-15"));
+        assert!(require_runtime_profile(&config, "trelis-15").is_err());
+        let modern = json!({"application_profiles":{"apex":[20],"trelis":[5,10,20]}});
+        fs::write(registry, serde_json::to_vec(&modern).unwrap()).unwrap();
+        assert!(local_stt_profiles(Some(&config)).iter().all(|profile| profile["available"] == true));
+        for profile in ["apex-20", "trelis-5", "trelis-10", "trelis-20"] {
+            assert!(require_runtime_profile(&config, profile).is_ok());
+        }
+        let malformed = json!({"application_profiles":{"apex":[20],"trelis":["5",10.0,-20]}});
+        assert!(!registry_supports_profile(Some(&malformed), "trelis-5"));
+        assert!(!registry_supports_profile(Some(&malformed), "trelis-10"));
+        assert!(!registry_supports_profile(Some(&malformed), "trelis-20"));
+        for bytes in [b"{broken".as_slice(), b"{}".as_slice()] {
+            fs::write(registry, bytes).unwrap();
+            assert!(local_stt_profiles(Some(&config)).iter().all(|profile| profile["available"] == false));
+            assert!(require_runtime_profile(&config, "trelis-10").is_err());
+        }
+        fs::remove_file(registry).unwrap();
+        assert!(local_stt_profiles(Some(&config)).iter().all(|profile| profile["available"] == false));
+        assert!(require_runtime_profile(&config, "trelis-10").is_err());
     }
     #[test] fn claude_chat_never_truncates_transcript_into_uri() {
         assert_eq!(claude_link("chat",None).unwrap(),"claude://claude.ai/new");

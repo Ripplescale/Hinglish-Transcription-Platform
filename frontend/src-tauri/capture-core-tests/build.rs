@@ -28,16 +28,22 @@ fn main() {
     let lifecycle = parsed.items.iter().find(|item| matches!(item, syn::Item::Fn(function) if function.sig.ident == "project_worker_lifecycle")).unwrap();
     fs::write(PathBuf::from(env::var("OUT_DIR").unwrap()).join("worker_lifecycle.rs"), quote!(#lifecycle).to_string()).unwrap();
     let helpers: Vec<_> = parsed.items.iter().filter(|item| matches!(item,
-        syn::Item::Fn(function) if ["read", "capture_ready_for_final", "validate_workflow_role"].contains(&function.sig.ident.to_string().as_str())
+        syn::Item::Fn(function) if ["read", "capture_ready_for_final", "validate_workflow_role", "profile_parts", "validate_final_profile", "local_stt_profiles", "project_request_metadata",
+            "runtime_registry", "registry_supports_profile", "require_runtime_profile"
+        ].contains(&function.sig.ident.to_string().as_str())
     )).collect();
-    assert_eq!(helpers.len(), 3, "Automatic-workflow helpers must be extracted from production source");
+    assert_eq!(helpers.len(), 10, "Automatic-workflow helpers must be extracted from production source");
     let tests: Vec<_> = parsed.items.iter().filter_map(|item| match item {
         syn::Item::Mod(module) if module.ident == "tests" => module.content.as_ref().map(|(_, items)| items),
         _ => None,
     }).flatten().filter(|item| matches!(item,
-        syn::Item::Fn(function) if ["automatic_roles_do_not_admit_swapped_models", "final_requires_committed_completion_or_matching_recovery"].contains(&function.sig.ident.to_string().as_str())
+        syn::Item::Fn(function) if ["automatic_roles_do_not_admit_swapped_models", "final_requires_committed_completion_or_matching_recovery",
+            "only_requested_profiles_are_admitted", "final_profile_metadata_admits_only_declared_trelis_profiles",
+            "restored_job_preserves_final_profile_metadata_and_legacy_absence", "synthetic_asr_runtime",
+            "profile_list_shares_runtime_availability_and_reports_each_duration", "registry_duration_guard_preserves_legacy_and_admits_modern_choices"
+        ].contains(&function.sig.ident.to_string().as_str())
     )).collect();
-    assert_eq!(tests.len(), 2, "Automatic-workflow assertions must stay linked to production tests");
+    assert_eq!(tests.len(), 8, "Automatic-workflow assertions must stay linked to production tests");
     fs::write(PathBuf::from(env::var("OUT_DIR").unwrap()).join("automatic_workflow.rs"), quote!(#(#helpers)* #(#tests)*).to_string()).unwrap();
     let snapshot_helpers: Vec<_> = parsed.items.iter().filter(|item| matches!(item,
         syn::Item::Fn(function) if ["read", "validate_asr_runtime", "ensure_job_runtime_snapshot"].contains(&function.sig.ident.to_string().as_str())

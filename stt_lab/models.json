@@ -80,6 +80,6 @@
   },
   "application_profiles": {
     "apex": [15, 20, 30],
-    "trelis": [15, 20]
+    "trelis": [5, 10, 20]
   }
 }

@@ -1,6 +1,6 @@
-# Privacy in xx
+# Privacy in oats
 
-xx records and transcribes calls locally on Windows. This document describes the local workflow in this fork, not upstream Meetily releases or external services.
+oats records and transcribes calls locally on Windows. This document describes the local workflow in this fork, not upstream Meetily releases or external services.
 
 ## Local storage
 
@@ -20,7 +20,7 @@ Some upstream provider code remains in the repository for provenance and compati
 
 ## Manual Claude handoff and exports
 
-Copying puts the transcript on the Windows clipboard. Copy-and-open opens Claude Desktop; file handoff creates a local TXT attachment. **You review and send it yourself.** No Claude API key is required and xx does not automatically submit the transcript. Content you send in Claude is handled by Claude and the relevant account's service settings.
+Copying puts the transcript on the Windows clipboard. Copy-and-open opens Claude Desktop; file handoff creates a local TXT attachment. **You review and send it yourself.** No Claude API key is required and oats does not automatically submit the transcript. Content you send in Claude is handled by Claude and the relevant account's service settings.
 
 Clipboard history, exports, and shared files are additional copies outside the app's local store.
 

@@ -21,8 +21,10 @@ from sttbench.manifest import digest, file_digest, read_json, write_json
 from sttbench.normalization import basic_tokens
 from sttbench.runtime import transcribe
 from sttbench.runtime.api import warmup
+from sttbench.speech_gate import assess_window
 
 PROFILES = {'apex-15': ('apex', 15), 'apex-20': ('apex', 20), 'apex-30': ('apex', 30),
+            'trelis-5': ('trelis', 5), 'trelis-10': ('trelis', 10),
             'trelis-15': ('trelis', 15), 'trelis-20': ('trelis', 20)}
 TRACKS = ('microphone', 'system')
 
@@ -133,6 +135,21 @@ def materialize(session: Path, rows: list[dict], start: float, end: float, targe
             'digital_silence': not bool(pcm.any()), 'resampler': 'scipy.signal.resample_poly'}
 
 
+def repetition_details(text: str) -> dict | None:
+    """Detect long consecutive 1..8-word loops without treating a triple as failure."""
+    words = basic_tokens(text)
+    for period in range(1, 9):
+        for start in range(len(words) - max(12, period * 4) + 1):
+            phrase = words[start:start + period]
+            cycles = 1
+            while words[start + cycles * period:start + (cycles + 1) * period] == phrase:
+                cycles += 1
+            if cycles >= 4 and cycles * period >= 12:
+                return {'start_word': start, 'period_words': period, 'cycles': cycles,
+                        'repeated_words': cycles * period, 'phrase': ' '.join(phrase)}
+    return None
+
+
 def review_flags(text: str, audio: dict, duration: float) -> list[str]:
     words = basic_tokens(text)
     flags = []
@@ -147,33 +164,104 @@ def review_flags(text: str, audio: dict, duration: float) -> list[str]:
         flags.append('very_quiet_audio')
     if duration >= 10 and audio['active_energy_seconds'] >= 8 and len(words) < audio['active_energy_seconds'] * .4:
         flags.append('suspiciously_sparse_text')
-    if len(words) >= 12 and any(words[i:i+4] == words[i+4:i+8] == words[i+8:i+12] for i in range(len(words)-11)):
+    if repetition_details(text):
         flags.append('repeated_phrase')
+    if audio.get('speech_gate', {}).get('status') == 'unavailable':
+        flags.append('speech_gate_unavailable')
     return flags
 
 
-def evaluate_window(spec, config, session, rows, start, end, target, infer=transcribe):
+def _recognize_window(spec, config, session, rows, start, end, target, infer, speech_gate, gate):
     audio = materialize(session, rows, start, end, target)
-    result = ({'status': 'ok', 'text': '', 'segments': [], 'warnings': ['Verified all-zero PCM; no speech inferred.'],
-               'provenance': {'digital_silence': True}, 'timing': {}} if audio['digital_silence'] else infer(spec, target, config))
+    if audio['digital_silence']:
+        return ({'status': 'ok', 'text': '', 'segments': [],
+                 'warnings': ['Verified all-zero PCM; no speech inferred.'],
+                 'provenance': {'digital_silence': True}, 'timing': {}}, audio)
+    if spec.get('id') == 'trelis':
+        # No amplitude or energy threshold can discard a nonzero recording.
+        # Silero receives analysis gain only; the inference WAV remains unchanged.
+        try:
+            assessment = gate(target, speech_gate)
+        except Exception as exc:
+            assessment = {'status': 'unavailable', 'skip_stt': False, 'decision': 'keep',
+                          'warning': 'speech_gate_unavailable', 'error': str(exc)}
+        audio['speech_gate'] = assessment
+        if assessment.get('status') == 'ok' and assessment.get('skip_stt') is True:
+            return ({'status': 'ok', 'text': '', 'segments': [],
+                     'warnings': ['Silero found no speech evidence in either original or analysis-gain pass.'],
+                     'provenance': {'speech_gate': assessment}, 'timing': {}}, audio)
+    try:
+        result = infer(spec, target, config)
+    except Exception as exc:
+        result = {'status': 'failed', 'text': '', 'error': str(exc)}
+    if audio.get('speech_gate', {}).get('status') == 'unavailable':
+        result = copy.deepcopy(result)
+        result.setdefault('warnings', []).append('speech_gate_unavailable: original audio retained for recognition.')
+    return result, audio
+
+
+def evaluate_window(spec, config, session, rows, start, end, target, infer=transcribe,
+                    speech_gate=None, gate=assess_window):
+    if speech_gate is None:
+        speech_gate = config.get('speech_gate')
+    result, audio = _recognize_window(spec, config, session, rows, start, end, target,
+                                      infer, speech_gate, gate)
     if result['status'] != 'ok':
         raise RuntimeError(result.get('error', 'Local model failed'))
     flags = review_flags(result['text'], audio, end-start)
     alternative = None
-    if 'suspiciously_sparse_text' in flags and end-start > 10:
-        # One bounded retry with disjoint <=10s windows; no lexical replacement.
+    original_result = copy.deepcopy(result)
+    trelis = spec.get('id') == 'trelis'
+    repeated = 'repeated_phrase' in flags
+    retry_seconds = 5 if trelis else 10
+    should_retry = ((trelis and repeated) or 'suspiciously_sparse_text' in flags) and end-start > retry_seconds
+    if should_retry:
+        # One bounded retry, using disjoint original-source windows. There is no
+        # recursive retry: even a looping 5s piece is preserved for review.
         pieces = []
-        for index, cursor in enumerate(range(round(start*16000), round(end*16000), 160000)):
-            left, right = cursor / 16000, min(end, (cursor + 160000) / 16000)
+        for index, cursor in enumerate(range(round(start*16000), round(end*16000), retry_seconds*16000)):
+            left, right = cursor / 16000, min(end, (cursor + retry_seconds*16000) / 16000)
             retry = target.with_name(target.stem + f'-retry-{index}.wav')
-            materialize(session, rows, left, right, retry)
-            candidate = infer(spec, retry, config)
-            pieces.append({'start_seconds': left, 'end_seconds': right, 'result': candidate})
-        if all(p['result']['status'] == 'ok' for p in pieces):
-            alternative = {'text': '\n\n'.join(p['result']['text'] for p in pieces), 'chunks': pieces,
-                           'requires_review': True, 'reason': 'Energy/text heuristic, not proof of missing speech'}
-        flags.append('retry_available' if alternative else 'retry_failed')
-    return {'text': result['text'], 'result': result, 'audio': audio, 'quality_flags': flags, 'alternative': alternative}
+            try:
+                candidate, candidate_audio = _recognize_window(spec, config, session, rows, left, right, retry,
+                                                               infer, speech_gate, gate)
+            except Exception as exc:
+                candidate = {'status': 'failed', 'text': '', 'error': str(exc)}
+                candidate_audio = None
+            candidate_flags = (review_flags(candidate['text'], candidate_audio, right-left)
+                               if candidate.get('status') == 'ok' else ['recognition_failed'])
+            pieces.append({'start_seconds': left, 'end_seconds': right, 'timestamp_kind': 'audio_window',
+                           'source_audio_sha256': audio['audio_sha256'], 'audio_provenance': candidate_audio,
+                           'quality_flags': candidate_flags, 'result': candidate})
+        all_ok = all(p['result'].get('status') == 'ok' for p in pieces)
+        joined = '\n\n'.join(p['result'].get('text', '') for p in pieces if p['result'].get('text'))
+        resolved = all_ok and not repetition_details(joined) and not any(
+            'repeated_phrase' in p['quality_flags'] for p in pieces)
+        # An empty recovery cannot establish that a speech-containing original
+        # should be erased; preserve both drafts and ask for review instead.
+        promoted = trelis and repeated and resolved and bool(joined.strip())
+        alternative = {'text': joined, 'chunks': pieces, 'requires_review': True, 'promoted': bool(promoted),
+                       'all_chunks_ok': all_ok, 'long_repetition_resolved': bool(resolved),
+                       'reason': ('Long repeated phrase; bounded shorter-window retry' if repeated
+                                  else 'Energy/text heuristic, not proof of missing speech')}
+        if promoted:
+            result = {'status': 'ok', 'text': joined, 'segments': [],
+                      'warnings': ['Shorter-window retry selected; original recognition preserved for review.'],
+                      'provenance': {'selection': 'shorter_window_retry', 'original_recognition_preserved': True},
+                      'timing': {'initial': original_result.get('timing', {}),
+                                 'retries': [p['result'].get('timing', {}) for p in pieces]}}
+            flags = review_flags(joined, audio, end-start)
+            flags.extend(['retry_applied', 'needs_review'])
+        else:
+            flags.append('retry_available' if all_ok else 'retry_failed')
+            if trelis and repeated:
+                flags.append('needs_review')
+        if any('speech_gate_unavailable' in p['quality_flags'] for p in pieces) and 'speech_gate_unavailable' not in flags:
+            flags.append('speech_gate_unavailable')
+    elif trelis and repeated:
+        flags.append('needs_review')
+    return {'text': result['text'], 'result': result, 'original_result': original_result, 'audio': audio,
+            'quality_flags': flags, 'alternative': alternative}
 
 
 @contextlib.contextmanager
@@ -239,6 +327,9 @@ def run_locked(config_path: Path, request_path: Path):
                                 mixed_code=request['language_mode'] != 'english')
     identity = {'request_sha256': file_digest(request_path), 'session_sha256': file_digest(session/'session.json'),
                 'spec': spec, 'runtime': runtime, 'worker_sha256': file_digest(Path(__file__))}
+    if model == 'trelis':
+        identity.update(speech_gate=config.get('speech_gate'),
+                        speech_gate_worker_sha256=file_digest(Path(__file__).with_name('speech_gate.py')))
     identity_hash = digest(identity)
     status_path = job/'status.json'
     status = read_json(status_path) if status_path.exists() else {
@@ -288,12 +379,13 @@ def run_locked(config_path: Path, request_path: Path):
                 target = job/'windows'/f'{track}-{round(cursor*16000)}.wav'
                 status['state'] = 'running'
                 write_json(status_path, status)
-                evaluated = evaluate_window(spec, runtime, session, rows[track], cursor, end, target)
+                window_runtime = {**runtime, 'speech_gate': config.get('speech_gate')} if model == 'trelis' else runtime
+                evaluated = evaluate_window(spec, window_runtime, session, rows[track], cursor, end, target)
                 status['segments'].append({'id': segment_id, 'text': evaluated['text'], 'start_seconds': cursor,
                     'end_seconds': end, 'source_track': track, 'timestamp_kind': 'audio_window', 'speaker': None,
                     'model_id': model, 'profile': request['profile'], 'quality_flags': evaluated['quality_flags'],
                     'alternative': evaluated['alternative'], 'audio_provenance': evaluated['audio'],
-                    'recognition': evaluated['result']})
+                    'recognition': evaluated['result'], 'recognition_original': evaluated['original_result']})
                 status['cursors'][track] = end
                 # Inference can be slower than capture; refresh the backlog clock.
                 fresh_rows, fresh_finalized, fresh_end, _ = journal_snapshot(session)

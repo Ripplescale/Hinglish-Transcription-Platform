@@ -143,7 +143,7 @@ def metrics(observed, elapsed, state, finalized_at, completed_at, commits):
 
 
 def run(output, profile, max_seconds=1500, run_name=None):
-    if profile not in ('apex-20','trelis-20'):raise ValueError('Only selected application profiles')
+    if profile not in ('apex-20','trelis-5','trelis-10','trelis-20'):raise ValueError('Only selected application profiles')
     manifest=read_json(output/'manifest.json');cfg=read_json(output/'runtime.json')
     Path(cfg['models']['apex']['work_dir']).mkdir(parents=True,exist_ok=True)
     if file_digest(output/'replay-source.wav')!=manifest['source_sha256']:raise ValueError('Replay source changed')

@@ -491,7 +491,7 @@ export function DownloadProgressStep() {
   return (
     <OnboardingContainer
       title="Getting things ready"
-      description="You can start using xx after downloading the Transcription Engine."
+      description="You can start using oats after downloading the Transcription Engine."
       step={3}
       totalSteps={isMac ? 4 : 3}
     >

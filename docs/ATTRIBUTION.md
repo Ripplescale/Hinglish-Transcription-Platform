@@ -1,6 +1,6 @@
 # Attribution and licenses
 
-The repository's [MIT license](../LICENSE.md) preserves **Copyright (c) 2024 Zackriya Solutions**. xx is an independent modification of [Meetily Community](https://github.com/Zackriya-Solutions/meetily), based on `v0.4.1`, commit `a2cb62e827da7ef59f65064c97233efb2313878e`. Existing upstream copyright notices are retained. Upstream documents and assets may still show the Meetily name; they do not describe every behavior of xx.
+The repository's [MIT license](../LICENSE.md) preserves **Copyright (c) 2024 Zackriya Solutions**. oats is an independent modification of [Meetily Community](https://github.com/Zackriya-Solutions/meetily), based on `v0.4.1`, commit `a2cb62e827da7ef59f65064c97233efb2313878e`. Existing upstream copyright notices are retained. Upstream documents and assets may still show the Meetily name; they do not describe every behavior of oats.
 
 ## Speech models
 
@@ -34,4 +34,4 @@ files separately from the application's MIT license.
 
 ## Project interface assets
 
-The xx icon and wordmark are project interface assets. The [workspace screenshot](assets/xx-workspace.png) was captured from the app with fictional demonstration data; it contains no user recording or private transcript. Historical Meetily assets retain their upstream provenance.
+The oats wordmark uses the bundled DynaPuff font. The Peach Buddy oat mascot with headphones and the listening illustration were generated with OpenAI ImageGen for this project on 7 October 2026. The app and installer icons are derived from the mascot asset. The [workspace screenshot](assets/xx-workspace.png) was captured from the app with fictional demonstration data; it contains no user recording or private transcript. Historical Meetily assets retain their upstream provenance.

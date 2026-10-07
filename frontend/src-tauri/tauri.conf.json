@@ -1,8 +1,8 @@
 {
     "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-    "productName": "xx",
+    "productName": "oats",
     "mainBinaryName": "xx",
-    "version": "0.7.2",
+    "version": "0.7.3",
     "identifier": "com.sttapp.local",
     "build": {
         "frontendDist": "../out",
@@ -14,14 +14,14 @@
         "withGlobalTauri": true,
         "windows": [
             {
-                "title": "xx",
+                "title": "oats",
                 "width": 680,
                 "height": 820,
                 "minWidth": 600,
                 "minHeight": 560,
                 "preventOverflow": true,
                 "center": true,
-                "backgroundColor": "#fff0f3",
+                "backgroundColor": "#ffeadf",
                 "resizable": true,
                 "fullscreen": false,
                 "theme": "Light",
@@ -95,7 +95,7 @@
     },
     "bundle": {
         "active": true,
-        "publisher": "xx",
+        "publisher": "oats",
         "shortDescription": "I listen and I don't judge",
         "targets": [
             "deb",

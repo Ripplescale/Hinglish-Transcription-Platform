@@ -1,8 +1,8 @@
 # Local speech workers and evaluation tools
 
-This directory contains xx's offline ASR worker, optional speaker worker, pinned registry, setup helpers, and test utilities. Start with [Windows setup](../docs/SETUP.md) and [how it works](../docs/HOW_IT_WORKS.md).
+This directory contains oats's offline ASR worker, optional speaker worker, pinned registry, setup helpers, and test utilities. Start with [Windows setup](../docs/SETUP.md) and [how it works](../docs/HOW_IT_WORKS.md).
 
-New recordings use **Apex 20-second Roman Hinglish Live Draft** during the call, then **Trelis 20-second original-script Final** after stopping. Apex saves its current window and exits before Trelis takes the worker. Both raw outputs and version-specific corrections are retained; “Final” remains machine output awaiting review. Trelis is not transliterated. Qwen summaries are disabled; Claude handoff is manual.
+New settings use **Trelis 10-second original-script transcription** during the call; 5- and 20-second choices are also available. The same job finishes after stopping. A conservative Silero gate retains uncertain speech, and long repeated output from windows longer than 5 seconds gets one retry in 5-second pieces. Apex 20-second Roman Hinglish remains a separate explicit fallback. Raw outputs and version-specific corrections are retained; “Final” remains machine output awaiting review. Trelis is not transliterated. Qwen summaries are disabled; Claude handoff is manual.
 
 One heavy worker runs at a time. Saved audio continues accumulating while jobs queue; a draft that never started before stop is skipped, while the Final can still process that recording. Paused/failed Finals require retry, and legacy jobs are never silently rewritten. Manual additional versions remain in Tools. The registry's other window sizes are experimental settings rather than routine recording controls.
 

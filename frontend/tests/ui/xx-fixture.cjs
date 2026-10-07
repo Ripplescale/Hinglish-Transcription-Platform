@@ -9,10 +9,10 @@ async function installFixture(page) {
     window.qaBoot = Math.random();
     const calls = []; window.qaCalls = calls;
     const meetings = [
-      { id: 'qa-meeting', title: 'Project Willow · Friday catch-up', created_at: '2026-09-30T09:30:00Z', updated_at: '2026-09-30T09:30:00Z', folder_path: 'C:/STTApp/recordings/qa-session' },
-      { id: 'qa-planning', title: 'Planning for next month', created_at: '2026-09-29T12:00:00Z', updated_at: '2026-09-29T12:00:00Z' },
-      { id: 'qa-design', title: 'Product catch-up', created_at: '2026-09-28T10:00:00Z', updated_at: '2026-09-28T10:00:00Z' },
-      { id: 'qa-draft', title: 'Project Willow · Live draft', created_at: '2026-09-30T09:30:00Z', updated_at: '2026-09-30T09:30:00Z', folder_path: 'C:/STTApp/recordings/qa-session' },
+      { id: 'qa-meeting', title: 'Project Willow · Friday catch-up', created_at: '2026-10-07T09:30:00Z', updated_at: '2026-10-07T09:30:00Z', folder_path: 'C:/STTApp/recordings/qa-session' },
+      { id: 'qa-planning', title: 'Planning for next month', created_at: '2026-10-06T12:00:00Z', updated_at: '2026-10-06T12:00:00Z' },
+      { id: 'qa-design', title: 'Product catch-up', created_at: '2026-10-05T10:00:00Z', updated_at: '2026-10-05T10:00:00Z' },
+      { id: 'qa-draft', title: 'Project Willow · Live draft', created_at: '2026-10-07T09:30:00Z', updated_at: '2026-10-07T09:30:00Z', folder_path: 'C:/STTApp/recordings/qa-session' },
     ];
     const segments = [
       { id: 'first', text: 'Welcome back, everyone. आज Project Willow की workshop plan करते हैं. Maya, would you like to walk us through the new sketchbook idea?', timestamp: '15:00', audio_start_time: 0, audio_end_time: 20, source_track: 'system' },
@@ -41,8 +41,11 @@ async function installFixture(page) {
     window.__TAURI_INTERNALS__ = { metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } }, convertFileSrc: () => '/qa-audio.wav', transformCallback: fn => { callbacks.set(++callbackId, fn); return callbackId; }, unregisterCallback: id => callbacks.delete(id),
       invoke: async (command, args = {}) => {
         calls.push({ command, args });
-        if (command === 'get_onboarding_status') return { completed: true };
+        if (command === 'get_onboarding_status') return { version: '1', completed: true, current_step: 4, model_status: { parakeet: 'not_downloaded', summary: 'not_downloaded' }, last_updated: '2026-10-07T00:00:00Z' };
         if (command === 'api_get_meetings') return meetings;
+        if (command === 'list_project_library') return { projects: [{ id: 'willow', name: 'Project Willow Vault', revision: 0, entry_count: 1 }], meetings: meetings.filter(meeting => meeting.id !== 'qa-draft').map(meeting => ({ ...meeting, project_id: meeting.id === 'qa-meeting' ? 'willow' : null, notes_preview: '' })) };
+        if (command === 'get_transcript_history') return [];
+        if (command === 'get_recording_meeting_name') return 'Project Willow · Friday catch-up';
         if (command === 'api_search_transcripts') return meetings.filter(item => item.title.toLowerCase().includes(args.query.toLowerCase())).map(item => ({ ...item, matches: [] }));
         if (command === 'api_save_meeting_title') { const meeting = meetings.find(item => item.id === args.meetingId); if (meeting) meeting.title = args.title; return null; }
         if (command === 'api_get_meeting_metadata') return args.meetingId === 'qa-draft' ? { ...meetings[0], id: 'qa-draft' } : meetings.find(item => item.id === args.meetingId) || meetings[0];
@@ -59,7 +62,7 @@ async function installFixture(page) {
           return saved;
         }
         if (command === 'local_get_meeting_audio') return { path: '/qa-audio.wav' };
-        if (command === 'get_local_stt_profiles') return ['trelis-20', 'apex-20'].map(id => ({ id, model: id.split('-')[0], chunk_seconds: 20, available: true, live_qualified: false }));
+        if (command === 'get_local_stt_profiles') return ['trelis-5', 'trelis-10', 'trelis-20', 'apex-20'].map(id => ({ id, model: id.split('-')[0], chunk_seconds: Number(id.split('-')[1]), available: true, live_qualified: false }));
         if (command === 'get_speaker_setup_status') return { available: true, enabled: true };
         if (command === 'list_project_vaults') return [vault];
         if (command === 'load_project_vault') return vault;

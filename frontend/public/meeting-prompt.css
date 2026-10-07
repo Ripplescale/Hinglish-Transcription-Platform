@@ -1,6 +1,7 @@
-:root { font-family: "Segoe UI", sans-serif; color: #392c31; background: #fff7f8; color-scheme: light; }
+:root { font-family: "Segoe UI", sans-serif; color: #482a23; background: #fffaf6; color-scheme: light; }
 * { box-sizing: border-box; } body { margin: 0; } main { padding: 20px; }
-.eyebrow { font-size: 10px; letter-spacing: 1.5px; color: #80636d; } h1 { font-size: 21px; margin: 12px 0 8px; font-weight: 600; }
-p { font-size: 13px; line-height: 1.5; margin: 0; color: #725c64; } .actions { display: flex; gap: 9px; margin: 18px 0 12px; }
-button { border: 1px solid #dfcbd1; border-radius: 8px; padding: 9px 15px; font: 600 13px "Segoe UI",sans-serif; background: #fff; color: #513b44; cursor: pointer; }
-#record { background: #7c3f56; border-color: #7c3f56; color: white; } button:focus-visible { outline: 3px solid #bd7893; outline-offset: 2px; } button:disabled { opacity: .55; cursor: default; } #status { font-size: 11px; }
+.brand { display: flex; align-items: center; gap: 10px; } .brand img { object-fit: contain; }
+.eyebrow { font-size: 10px; letter-spacing: 1.2px; color: #71574d; } h1 { font-size: 21px; margin: 10px 0 8px; font-weight: 650; }
+p { font-size: 13px; line-height: 1.5; margin: 0; color: #71574d; } .actions { display: flex; gap: 9px; margin: 16px 0 12px; }
+button { border: 1px solid #ead6cb; border-radius: 12px; padding: 9px 15px; font: 600 13px "Segoe UI",sans-serif; background: #fffdfb; color: #482a23; cursor: pointer; }
+#record { background: #ffb69e; border-color: #ffb69e; color: #482a23; } #record:hover { background: #ffa98d; } #dismiss:hover { background: #fff0e8; } button:focus-visible { outline: 3px solid #915746; outline-offset: 2px; } button:disabled { opacity: .55; cursor: default; } #status { font-size: 11px; }

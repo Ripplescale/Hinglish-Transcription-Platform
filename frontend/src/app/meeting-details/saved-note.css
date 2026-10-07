@@ -11,8 +11,8 @@
 .xx-saved-note-body { position: relative; display: flex; flex: 1; min-height: 0; min-width: 0; }
 .xx-saved-note-canvas { display: flex; flex: 1; min-height: 0; min-width: 0; justify-content: center; }
 .xx-saved-note-editor { flex: 1; width: 100%; max-width: 744px; min-height: 0; resize: none; border: 0; border-radius: 0; background: transparent; padding: 24px 32px 40px; color: var(--xx-ink); font-size: 15px; line-height: 1.9; outline: none !important; }
-.xx-saved-note-editor::placeholder { color: var(--xx-muted); opacity: .65; }
-.xx-saved-note-editor:focus-visible { box-shadow: inset 2px 0 0 #ead9df70; }
+.xx-saved-note-editor::placeholder { color: var(--xx-muted); opacity: 1; }
+.xx-saved-note-editor:focus-visible { box-shadow: inset 2px 0 0 #ead7ca70; }
 .xx-saved-note-transcript { width: 46%; min-width: 300px; max-width: 560px; border-left: 1px solid var(--xx-border); }
 .xx-saved-note-transcript[hidden] { display: none; }
 .xx-saved-note-dock { display: flex; align-items: center; gap: 12px; flex-shrink: 0; min-height: 61px; padding: 9px 20px; border-top: 1px solid var(--xx-border); }

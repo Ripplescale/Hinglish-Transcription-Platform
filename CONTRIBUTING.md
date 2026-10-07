@@ -1,4 +1,4 @@
-# Contributing to xx
+# Contributing to oats
 
 Start with [setup](docs/SETUP.md) and [how it works](docs/HOW_IT_WORKS.md). Current development targets Windows x64. Inherited macOS/Linux files do not establish support for those platforms in this fork.
 

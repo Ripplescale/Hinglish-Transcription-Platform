@@ -128,7 +128,7 @@ pub async fn respond_to_meeting(
             return Err("This call prompt has expired".into());
         }
         if record && (!inner.enabled || !inner.ready) {
-            return Err("Open xx and finish setup first".into());
+            return Err("Open oats and finish setup first".into());
         }
         inner.pending = None;
         if record {
@@ -165,7 +165,7 @@ fn show_prompt(app: &tauri::AppHandle) -> Result<(), String> {
                 "meeting-prompt",
                 tauri::WebviewUrl::App("meeting-prompt.html".into()),
             )
-            .title("Call detected · xx")
+            .title("Call detected · oats")
             .inner_size(370.0, 270.0)
             .resizable(false)
             .maximizable(false)

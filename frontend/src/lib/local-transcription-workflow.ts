@@ -1,9 +1,11 @@
 /** Coordinates durable native jobs; capture and model inference stay outside this class. */
 export type WorkflowRole = 'live-draft' | 'final' | 'live-final' | 'fallback';
+export type TrelisProfileId = 'trelis-5' | 'trelis-10' | 'trelis-20';
+export type LocalProfileId = TrelisProfileId | 'apex-20';
 export interface LocalProfile { id: string; model: string; chunk_seconds: number; available: boolean; reason?: string; live_qualified: boolean }
 export interface LocalSegment { id: string; text: string; source_track: string; start_seconds?: number; end_seconds?: number; quality_flags?: string[] }
-export interface LocalJob { job_id: string; session_dir: string; profile: string; state: string; phase?: string; workflow_role?: WorkflowRole; capture_session_id?: string; language_mode?: 'hinglish' | 'english'; processed_audio_seconds?: number; available_audio_seconds?: number; backlog_seconds?: number; segments?: LocalSegment[]; error?: string }
-export interface LocalPreferences { profile: 'trelis-20' | 'apex-20'; languageMode: 'hinglish' | 'english'; timing: 'after-recording' | 'during-recording' }
+export interface LocalJob { job_id: string; session_dir: string; profile: string; final_profile?: TrelisProfileId; state: string; phase?: string; workflow_role?: WorkflowRole; capture_session_id?: string; language_mode?: 'hinglish' | 'english'; processed_audio_seconds?: number; available_audio_seconds?: number; backlog_seconds?: number; segments?: LocalSegment[]; error?: string }
+export interface LocalPreferences { profile: LocalProfileId; languageMode: 'hinglish' | 'english'; timing: 'after-recording' | 'during-recording' }
 export interface SpeakerJob { job_id: string; state: string; error?: string; result?: unknown }
 export interface SpeakerSetup { available: boolean; enabled?: boolean; reason?: string }
 export interface CaptureSession { session_id: string; session_dir: string }
@@ -14,18 +16,23 @@ export interface WorkflowRun {
   draftSkipped?: boolean; stopRequested?: boolean; stopAttempted?: boolean; stopError?: string;
   pausedByUser?: boolean; resumeRequested?: boolean; captureEnded?: boolean; stopNotified?: boolean;
   fallbackRequested?: boolean;
+  finalProfile?: TrelisProfileId;
 }
 export interface WorkflowState { preferences: LocalPreferences; runs: WorkflowRun[]; currentSession?: string; speakerSetup?: SpeakerSetup }
-export const DEFAULT_LOCAL_PREFERENCES: LocalPreferences = { profile: 'trelis-20', languageMode: 'hinglish', timing: 'during-recording' };
+export const DEFAULT_LOCAL_PREFERENCES: LocalPreferences = { profile: 'trelis-10', languageMode: 'hinglish', timing: 'during-recording' };
+export const isTrelisProfile = (profile: unknown): profile is TrelisProfileId => ['trelis-5', 'trelis-10', 'trelis-20'].includes(String(profile));
+export const trelisProfile = (profile: unknown): TrelisProfileId => isTrelisProfile(profile) ? profile : 'trelis-10';
+export const profileChunkSeconds = (profile: LocalProfileId): number => Number(profile.split('-')[1]);
+export const profileLabel = (profile: unknown): string | null => profile === 'apex-20' ? 'Apex · 20s' : isTrelisProfile(profile) ? `Trelis · ${profileChunkSeconds(profile)}s` : null;
 export const isTerminalJob = (state: string) => ['complete', 'failed', 'stopped'].includes(state);
 export const pathKey = (value: string) => value.replace(/^\\\\\?\\/, '').replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
 /** Global settings describe new recordings. Existing run settings are never migrated. */
 export function readPreferences(value: unknown): LocalPreferences {
   const source = value && typeof value === 'object' ? value as Partial<LocalPreferences> : {};
-  return { ...DEFAULT_LOCAL_PREFERENCES, languageMode: source.languageMode === 'english' ? 'english' : 'hinglish' };
+  return { ...DEFAULT_LOCAL_PREFERENCES, profile: trelisProfile(source.profile), languageMode: source.languageMode === 'english' ? 'english' : 'hinglish' };
 }
 function jobPreferences(job: LocalJob, languageMode: LocalPreferences['languageMode']): LocalPreferences {
-  return { profile: job.profile === 'trelis-20' ? 'trelis-20' : 'apex-20', languageMode: job.language_mode ?? languageMode,
+  return { profile: isTrelisProfile(job.profile) ? job.profile : 'apex-20', languageMode: job.language_mode ?? languageMode,
     timing: ['live-draft', 'live-final', 'fallback'].includes(job.workflow_role ?? '') ? 'during-recording' : 'after-recording' };
 }
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -64,7 +71,8 @@ export class LocalWorkflow {
     if (!run) {
       const fallback = this.state.runs.find(item => item.role === 'fallback' && this.sameCapture(item, capture));
       run = { capture, role: 'live-final', primary: true, recording, captureEnded: !recording,
-        preferences: { profile: 'trelis-20', timing: 'during-recording', languageMode: fallback?.preferences.languageMode ?? this.state.preferences.languageMode },
+        // Old fallback jobs predate selectable chunk lengths and used Trelis20.
+        preferences: { profile: trelisProfile(fallback ? fallback.finalProfile ?? fallback.job?.final_profile ?? 'trelis-20' : this.state.preferences.profile), timing: 'during-recording', languageMode: fallback?.preferences.languageMode ?? this.state.preferences.languageMode },
         meetingId: fallback?.meetingId, pausedByUser: !!fallback, fallbackRequested: !!fallback };
       this.state.runs.push(run);
     }
@@ -73,17 +81,18 @@ export class LocalWorkflow {
   private pair(capture: CaptureSession, recording: boolean): [WorkflowRun, WorkflowRun] {
     const existing = this.state.runs.filter(run => run.role && this.sameCapture(run, capture));
     const languageMode = existing[0]?.preferences.languageMode ?? this.state.preferences.languageMode;
+    const finalProfile = trelisProfile(existing.find(run => isTrelisProfile(run.preferences.profile))?.preferences.profile ?? existing[0]?.finalProfile ?? this.state.preferences.profile);
     const ended = existing.some(run => run.captureEnded) || !recording;
     let draft = existing.find(run => run.role === 'live-draft');
     let final = existing.find(run => run.role === 'final');
     if (!draft) {
       draft = { capture, role: 'live-draft', primary: false, recording: !ended,
-        preferences: { profile: 'apex-20', timing: 'during-recording', languageMode }, captureEnded: ended };
+        preferences: { profile: 'apex-20', timing: 'during-recording', languageMode }, finalProfile, captureEnded: ended };
       this.state.runs.push(draft);
     }
     if (!final) {
       final = { capture, role: 'final', primary: true, recording: !ended,
-        preferences: { profile: 'trelis-20', timing: 'after-recording', languageMode }, captureEnded: ended };
+        preferences: { profile: finalProfile, timing: 'after-recording', languageMode }, captureEnded: ended };
       this.state.runs.push(final);
     }
     const meetingId = final.meetingId ?? draft.meetingId;
@@ -211,6 +220,7 @@ export class LocalWorkflow {
     try {
       const args: Record<string, unknown> = { sessionDir: run.capture.session_dir, profile: run.preferences.profile, languageMode: run.preferences.languageMode, projectId: null };
       if (run.role) args.workflowRole = run.role;
+      if (run.finalProfile) args.finalProfile = run.finalProfile;
       const job = await this.dependencies.invoke<LocalJob>('start_local_transcription', args);
       run.job = { ...job, session_dir: run.capture.session_dir, profile: run.preferences.profile, ...(run.role ? { workflow_role: run.role } : {}) };
       run.error = undefined;
@@ -279,7 +289,7 @@ export class LocalWorkflow {
       if (!fallback) {
         fallback = { capture: run.capture, meetingId: run.meetingId, role: 'fallback', primary: false,
           recording: run.recording, captureEnded: run.captureEnded,
-          preferences: { profile: 'apex-20', timing: 'during-recording', languageMode: run.preferences.languageMode } };
+          preferences: { profile: 'apex-20', timing: 'during-recording', languageMode: run.preferences.languageMode }, finalProfile: trelisProfile(run.preferences.profile) };
         this.state.runs.push(fallback);
       } else {
         fallback.pausedByUser = false; fallback.error = undefined;
@@ -296,7 +306,7 @@ export class LocalWorkflow {
     if (!run) {
       run = { capture: { session_id: job.capture_session_id ?? `job-${job.job_id}`, session_dir: job.session_dir }, meetingId,
         recording: false, captureEnded: !!job.workflow_role, primary: ['final', 'live-final'].includes(job.workflow_role ?? '') ? true : job.workflow_role === 'fallback' ? false : primary,
-        role: job.workflow_role, preferences: jobPreferences(job, this.state.preferences.languageMode), job };
+        role: job.workflow_role, preferences: jobPreferences(job, this.state.preferences.languageMode), finalProfile: job.final_profile, job };
       this.state.runs.push(run);
     } else if (!run.job) run.job = job;
     this.changed();
@@ -318,7 +328,7 @@ export class LocalWorkflow {
       if (!role && primary) legacyPrimary = true;
       this.state.runs.push({ capture, meetingId: base.meeting_id, role, primary,
         recording: !!role || primary, captureEnded: role ? false : undefined,
-        preferences: jobPreferences(job, this.state.preferences.languageMode), job });
+        preferences: jobPreferences(job, this.state.preferences.languageMode), finalProfile: job.final_profile, job });
     }
     if (matching.some(job => job.workflow_role === 'fallback')) {
       const live = this.state.runs.find(run => run.role === 'live-final' && this.sameCapture(run, capture));

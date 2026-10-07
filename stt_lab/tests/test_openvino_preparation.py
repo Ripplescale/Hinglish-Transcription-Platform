@@ -145,6 +145,27 @@ class OpenVINOPreparationTests(unittest.TestCase):
         self.assertEqual(snapshot,older)
         self.assertEqual(snapshot['models']['trelis']['threads'],2)
 
+    def test_gate_identity_prevents_matching_a_changed_detection_configuration(self):
+        gate_worker=Path(self.current['worker_script']).parent/'sttbench/speech_gate.py'
+        gate_worker.write_text('# original gate',encoding='utf-8')
+        self.current['speech_gate']={'threshold':0.15}
+        write_json(self.data/'runtime.json',self.current)
+        job=self.job('gate-bound')
+        status=read_json(job/'status.json')
+        status['identity'].update(speech_gate=copy.deepcopy(self.current['speech_gate']),
+                                  speech_gate_worker_sha256=file_digest(gate_worker))
+        status['identity_sha256']=digest(status['identity'])
+        write_json(job/'status.json',status)
+        original_runtime=copy.deepcopy(self.current)
+        self.current['speech_gate']['threshold']=0.1
+        write_json(self.data/'runtime.json',self.current)
+        report=self.prepare()
+        with self.assertRaisesRegex(ValueError,'No verified historical runtime'):
+            installer.activate_runtime(self.data,Path(report['candidate_runtime']))
+        write_json(self.data/'runtime/previous-original-gate.json',original_runtime)
+        installer.activate_runtime(self.data,Path(report['candidate_runtime']))
+        self.assertEqual(read_json(job/'runtime-snapshot.json'),original_runtime)
+
     def test_unmatched_checkpoint_prevents_all_migration_and_activation(self):
         good=self.job('a-good')
         unknown=self.runtime('unrecorded-worker',threads=8)
@@ -207,6 +228,53 @@ class OpenVINOPreparationTests(unittest.TestCase):
         self.assertTrue(Path(report['candidate_runtime']).is_file())
         self.assertEqual((self.data/'runtime.json').read_bytes(),self.active_bytes)
         self.assertFalse((self.data/'vaults').exists())
+
+    def test_worker_update_stages_gate_and_profiles_without_changing_models_or_history(self):
+        job=self.job('existing-update')
+        checkpoint=(job/'status.json').read_bytes()
+        report=installer.update_existing(self.data)
+        candidate=read_json(Path(report['candidate_runtime']))
+        self.assertFalse(report['activated'])
+        self.assertEqual(candidate['models'],self.current['models'])
+        self.assertEqual(candidate['python_executable'],self.current['python_executable'])
+        self.assertEqual(candidate['preserve_top_level'],'unchanged')
+        self.assertEqual(candidate['speech_gate']['threshold'],0.15)
+        self.assertEqual((self.data/'runtime.json').read_bytes(),self.active_bytes)
+        self.assertEqual((job/'status.json').read_bytes(),checkpoint)
+        self.assertFalse((job/'runtime-snapshot.json').exists())
+
+
+class SpeechGateProvisioningTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(prefix='speech-gate-install-')
+        self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name)
+
+    def test_missing_model_remains_explicit_without_suppressing_input(self):
+        configuration=installer.install_speech_gate(self.root)
+        self.assertEqual(configuration['model_sha256'],installer.SILERO_SHA256)
+        self.assertEqual(configuration['threshold'],0.15)
+        self.assertFalse(Path(configuration['model_path']).exists())
+
+    def test_copy_is_verified_durable_and_reused(self):
+        source=self.root/'provided.onnx';source.write_bytes(b'synthetic gate asset')
+        with patch.object(installer,'SILERO_SHA256',file_digest(source)):
+            configuration=installer.install_speech_gate(self.root,source)
+            target=Path(configuration['model_path'])
+            self.assertTrue(target.is_relative_to(self.root/'lab/models/silero'))
+            self.assertEqual(target.read_bytes(),source.read_bytes())
+            original=target.stat().st_mtime_ns
+            self.assertEqual(installer.install_speech_gate(self.root,source),configuration)
+            self.assertEqual(target.stat().st_mtime_ns,original)
+            target.write_bytes(b'tampered')
+            with self.assertRaisesRegex(ValueError,'differs from the pinned'):
+                installer.install_speech_gate(self.root)
+
+    def test_unverified_source_is_rejected_without_copying(self):
+        source=self.root/'provided.onnx';source.write_bytes(b'unverified')
+        with self.assertRaisesRegex(ValueError,'pinned SHA-256'):
+            installer.install_speech_gate(self.root,source)
+        self.assertFalse((self.root/'lab/models').exists())
 
 
 if __name__=='__main__':unittest.main()

@@ -1,14 +1,14 @@
-# xx
+# oats
 
 **I listen and I don't judge**
 
-Hinglish Transcription Platform is a local Windows desktop app for recording calls, keeping the audio, and working with Hindi–English transcripts. It builds on Meetily Community with a local inference worker and a notes-first workspace.
+oats is a local Windows desktop app for recording calls, keeping the audio, and working with Hindi–English transcripts. It builds on Meetily Community with a local inference worker and a notes-first workspace.
 
-![xx compact notes workspace with recording playback and an expandable transcript](docs/assets/xx-workspace.png)
+![oats compact notes workspace with recording playback and an expandable transcript](docs/assets/xx-workspace.png)
 
 *The screenshot uses fictional conversations, names, and quantities.*
 
-![xx notes library grouped by project](docs/assets/xx-library.png)
+![oats notes library grouped by project](docs/assets/xx-library.png)
 
 ## What it does
 
@@ -17,7 +17,7 @@ Hinglish Transcription Platform is a local Windows desktop app for recording cal
 - Provides **Project memory**: source-linked saved-note excerpts and checked project references. It does not generate facts or infer a knowledge graph from unverified speech.
 - Records microphone and system audio into separate local tracks, with a recovery journal written before transcription.
 - Offers a small **Record call / Dismiss** prompt when Zoom or Teams desktop activates its microphone. Recording starts only after you choose; no calendar connection is needed. [Detection limits and settings](docs/MEETING_DETECTION.md).
-- Runs **Trelis · 20 seconds · OpenVINO GPU FP16** during the call, preserving its original Hindi/English script. The same job finishes any remaining saved audio after you stop; there is no second full transcription pass.
+- Offers **Trelis chunks of 5, 10, or 20 seconds**, with 10 seconds as the default for new settings. OpenVINO GPU FP16 preserves the original Hindi/English script. A conservative speech check skips confident nonspeech, and long repetitions get one retry in 5-second pieces. The same job finishes any remaining saved audio after you stop.
 - Offers **Apex · 20 seconds** as an explicit fallback. Trelis pauses after its current window, then Apex replays the saved audio into a separate Roman Hinglish version.
 - Retains raw output, separate corrections, and history. “Final transcript” means the Trelis job completed; it remains unreviewed machine output until you check it.
 - Keeps recordings, transcripts, notes, speaker review, and playback together.
@@ -29,7 +29,9 @@ Hinglish Transcription Platform is a local Windows desktop app for recording cal
 
 Read **[Windows setup](docs/SETUP.md)** for the existing installation and developer setup path. **[How it works](docs/HOW_IT_WORKS.md)** explains capture, models, revisions, retries, and storage. **[Privacy](PRIVACY_POLICY.md)** describes local processing and manual export.
 
-The everyday flow is **choose a project → New note → write while xx records → stop → review/export**. The transcript starts collapsed and continues processing in the background. Updates use 20-second windows **plus processing and queueing time**, and GPU startup adds initial delay. One heavy worker runs at a time, so back-to-back calls can queue; recording continues independently. A GPU failure is shown explicitly, without silently switching Trelis to CPU. Choose Apex fallback or retry when ready. Existing transcript versions, including older Apex-draft/Trelis-final calls, keep their original workflow and corrections.
+See [oats 0.7.3 release notes](docs/releases/0.7.3.md) for the Peach Buddy design and the paired desktop/worker update.
+
+The everyday flow is **choose a project → New note → write while oats records → stop → review/export**. The transcript starts collapsed and continues processing in the background. Updates use the chosen chunk length **plus processing and queueing time**, and GPU startup adds initial delay. One heavy worker runs at a time, so back-to-back calls can queue; recording continues independently. A GPU failure is shown explicitly, without silently switching Trelis to CPU. Choose Apex fallback or retry when ready. Existing transcript versions, including older Apex-draft/Trelis-final calls, keep their original workflow and corrections.
 
 Outlook calendar sync and automatically generated pre-meeting recaps are not enabled. An approved calendar integration is required before attendee matching can be connected to saved notes; see [meeting preparation](docs/HOW_IT_WORKS.md#meeting-preparation).
 
@@ -37,13 +39,13 @@ The integrated GPU adapter reproduced **23/23 CPU chunk outputs over 400.15 seco
 
 This is an early Windows implementation. The installer currently reuses model files and isolated Python environments already prepared on the same laptop; it is not a complete model bundle for an unconfigured computer. Clean-machine installation and broad hardware qualification remain work to do. The repository does not contain private recordings, benchmark references, model weights, or credentials.
 
-The 20-second windows are current defaults, not a universal accuracy optimum. Names, numbers, units, overlap, and quiet input can still be wrong. Automatic flags and retries help find some failures; they do not prove completeness. Two-hour calls, headset reconnects, and live speaker recognition are not yet fully qualified. Screen video and shared workspaces are outside the current scope.
+The 10-second default is not a universal accuracy optimum. Names, numbers, units, overlap, and quiet input can still be wrong. Automatic flags and retries help find some failures; they do not prove completeness. Two-hour calls, headset reconnects, and live speaker recognition are not yet fully qualified. Screen video and shared workspaces are outside the current scope.
 
 ## Development
 
 The app uses Tauri/Rust, Next.js/React, and SQLite. Local Python workers run the selected speech models and optional diarization. See [contributing](CONTRIBUTING.md) for focused checks and the [runtime guide](stt_lab/README.md) for setup tools.
 
-The repository is named **Hinglish Transcription Platform**; the application is **xx**. Its existing `com.sttapp.local` identity and `STTApp` data directory are retained so upgrades preserve local work.
+The repository is named **Hinglish Transcription Platform**; the application is **oats** (previously xx). Its existing `com.sttapp.local` identity and `STTApp` data directory are retained so upgrades preserve local work.
 
 ## Attribution
 

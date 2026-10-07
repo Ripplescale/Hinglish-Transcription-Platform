@@ -226,7 +226,7 @@ export default function RootLayout({
 
   return (
     <html lang="en">
-      <head><title>xx · I listen and I don't judge</title><meta name="description" content="A local workspace for your Hinglish calls, transcripts and notes." /><link rel="icon" href="/xx-icon.png" /></head>
+      <head><title>oats · I listen and I don't judge</title><meta name="description" content="A local workspace for your Hinglish calls, transcripts and notes." /><link rel="icon" href="/oats-buddy.png" /></head>
       <body className="font-sans antialiased" style={localFontStyle}>
         <AnalyticsProvider>
           <RecordingStateProvider>

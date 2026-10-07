@@ -1,4 +1,4 @@
-# Matched acceleration runtime, independently installed. No VAD is activated.
+# Matched acceleration runtime with ONNX support for the conservative speech gate.
 accelerate==1.10.1
 certifi==2026.7.22
 cffi==2.1.1

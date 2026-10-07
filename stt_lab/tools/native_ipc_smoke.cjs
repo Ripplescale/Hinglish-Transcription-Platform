@@ -20,7 +20,7 @@ async function main() {
   try {
     await page.waitForFunction(() => typeof window.__TAURI_INTERNALS__?.invoke === 'function');
     const profiles = await invoke('get_local_stt_profiles');
-    assert.deepEqual(profiles.map(item => item.id).sort(), ['apex-20', 'trelis-20']);
+    assert.deepEqual(profiles.map(item => item.id).sort(), ['apex-20', 'trelis-10', 'trelis-20', 'trelis-5']);
     assert(profiles.every(item => item.available));
     assert.equal(await invoke('get_active_capture'), null);
     checked('Real IPC: selected models available, no active device capture');

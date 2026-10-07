@@ -42,7 +42,7 @@ export function LegacyDatabaseImport({ isOpen, onComplete }: LegacyDatabaseImpor
         setDetectedPath(dbPath);
         setImportState('idle');
       } else {
-        setErrorMessage('No database found at selected location. Please select the xx folder, backend folder, or the database file directly.');
+        setErrorMessage('No database found at selected location. Please select the previous application folder, backend folder, or the database file directly.');
         setDetectedPath(null);
         setImportState('error');
         setTimeout(() => setImportState('idle'), 3000);
@@ -119,9 +119,9 @@ export function LegacyDatabaseImport({ isOpen, onComplete }: LegacyDatabaseImpor
     <Dialog open={isOpen} onOpenChange={() => {}}>
       <DialogContent className="sm:max-w-[600px]" onPointerDownOutside={(e) => e.preventDefault()}>
         <DialogHeader>
-          <DialogTitle className="text-2xl">Welcome to xx!</DialogTitle>
+          <DialogTitle className="text-2xl">Welcome to oats!</DialogTitle>
           <DialogDescription className="text-base pt-2">
-            Do you have data from a previous xx installation?
+            Do you have data from a previous installation?
           </DialogDescription>
         </DialogHeader>
 
@@ -135,7 +135,7 @@ export function LegacyDatabaseImport({ isOpen, onComplete }: LegacyDatabaseImpor
           {/* Browse Section */}
           <div className="space-y-3">
             <p className="text-sm text-gray-600">
-              Select your previous xx folder, backend directory, or database file:
+              Select your previous application folder, backend directory, or database file:
             </p>
 
             <button

@@ -130,11 +130,11 @@ export default function Sidebar() {
       </>}
       <div className="xx-sidebar-footer w-full">
         <button className="xx-nav-button" aria-label="Settings" title="Settings" aria-current={pathname === '/settings' ? 'page' : undefined} onClick={() => navigate('/settings')}><Settings />{!isCollapsed && 'Settings'}</button>
-        <button className="xx-nav-button" aria-label="About xx" title="About xx" onClick={() => setAbout(true)}><Info />{!isCollapsed && 'About xx'}</button>
+        <button className="xx-nav-button" aria-label="About oats" title="About oats" onClick={() => setAbout(true)}><Info />{!isCollapsed && 'About oats'}</button>
         {!isCollapsed && <p className="xx-local-status"><HardDrive size={12} />Saved on your laptop</p>}
       </div>
     </aside>
-    <Dialog open={about} onOpenChange={setAbout}><DialogContent className="max-w-md"><DialogTitle className="sr-only">About xx</DialogTitle><About /></DialogContent></Dialog>
+    <Dialog open={about} onOpenChange={setAbout}><DialogContent className="max-w-md"><DialogTitle className="sr-only">About oats</DialogTitle><About /></DialogContent></Dialog>
     <Dialog open={!!rename} onOpenChange={open => { if (!open && !busy) setRename(null); }}><DialogContent className="max-w-md"><DialogTitle>Rename conversation</DialogTitle><DialogDescription>A title that makes it easy to find later.</DialogDescription><form onSubmit={event => { event.preventDefault(); void saveTitle(); }} className="space-y-5"><input autoFocus aria-label="Conversation title" value={title} onChange={event => setTitle(event.target.value)} maxLength={200} className="w-full rounded-lg border bg-transparent p-3 text-sm" /><DialogFooter><button type="button" className="xx-button-secondary" disabled={busy} onClick={() => setRename(null)}>Cancel</button><button className="xx-button-primary" disabled={busy || !title.trim()}>{busy ? 'Saving…' : 'Save title'}</button></DialogFooter></form></DialogContent></Dialog>
     <Dialog open={!!remove} onOpenChange={open => { if (!open && !busy) setRemove(null); }}><DialogContent className="max-w-md"><DialogTitle>Remove this conversation?</DialogTitle><DialogDescription>“{remove?.title}” and its saved transcript versions and notes will be removed from the workspace. This cannot be undone.</DialogDescription><DialogFooter><button className="xx-button-secondary" disabled={busy} onClick={() => setRemove(null)}>Keep conversation</button><button className="xx-button-primary" disabled={busy || isRecording} onClick={() => void deleteMeeting()}>{busy ? 'Removing…' : 'Remove conversation'}</button></DialogFooter></DialogContent></Dialog>
   </>;

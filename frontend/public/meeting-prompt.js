@@ -23,7 +23,7 @@
     prompt = value;
     if (!prompt) { status.textContent = 'This call prompt has expired.'; return; }
     document.getElementById('title').textContent = `${prompt.app} audio detected`;
-    document.getElementById('description').textContent = 'In a call? Save the audio and take notes in xx.';
+    document.getElementById('description').textContent = 'In a call? Save the audio and take notes in oats.';
     record.disabled = dismiss.disabled = false;
-  }).catch(() => { status.textContent = 'Open xx to start recording.'; });
+  }).catch(() => { status.textContent = 'Open oats to start recording.'; });
 })();

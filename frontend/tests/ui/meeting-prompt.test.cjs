@@ -9,8 +9,8 @@ const http = require('node:http');
   const root = path.resolve(__dirname, '../../public');
   const server = http.createServer((req, res) => {
     const name = req.url.slice(1);
-    if (!['meeting-prompt.html', 'meeting-prompt.js', 'meeting-prompt.css'].includes(name)) { res.writeHead(404).end(); return; }
-    res.setHeader('Content-Type', name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html');
+    if (!['meeting-prompt.html', 'meeting-prompt.js', 'meeting-prompt.css', 'oats-buddy.png'].includes(name)) { res.writeHead(404).end(); return; }
+    res.setHeader('Content-Type', name.endsWith('.png') ? 'image/png' : name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html');
     res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'");
     res.end(fs.readFileSync(path.join(root, name)));
   });
@@ -26,10 +26,11 @@ const http = require('node:http');
           window.calls.push({ command, args });
           if (command === 'meeting_prompt') return scenario === 'expired' ? null : { id: 7, app: 'Microsoft Teams' };
           if (command !== 'respond_to_meeting') throw Error('Unexpected command');
-          if (scenario === 'error' && args.record) throw Error('Open xx and finish setup first');
+          if (scenario === 'error' && args.record) throw Error('Open oats and finish setup first');
         } } };
       }, { scenario });
       await page.goto(`http://127.0.0.1:${server.address().port}/meeting-prompt.html`);
+      await page.waitForFunction(() => { const buddy = document.querySelector('.brand img'); return buddy?.complete && buddy.naturalWidth > 0; });
       if (scenario === 'expired') {
         await page.getByText('This call prompt has expired.').waitFor();
         assert.equal(await page.locator('#record').isDisabled(), true);
@@ -46,7 +47,7 @@ const http = require('node:http');
         else if (scenario === 'escape') await page.keyboard.press('Escape');
         else {
           await page.locator('#record').click();
-          await page.getByText('Open xx and finish setup first').waitFor();
+          await page.getByText('Open oats and finish setup first').waitFor();
           await page.locator('#dismiss').click();
         }
         const calls = await page.evaluate(() => window.calls.filter(c => c.command === 'respond_to_meeting'));

@@ -122,6 +122,173 @@ class LocalWorkerTests(unittest.TestCase):
                                         self.root / 'audible.wav', infer)
         self.assertNotIn('very_quiet_audio', result['quality_flags'])
 
+    def keep_gate(self, *args):
+        return {'status': 'ok', 'skip_stt': False, 'decision': 'keep',
+                'model_sha256': 'a' * 64, 'elapsed_seconds': .01,
+                'raw_max_probability': .6, 'boosted_max_probability': .8}
+
+    def test_repetition_recognizes_three_word_loop_but_allows_short_repeats(self):
+        for phrase in ('जब', 'वो जब', 'वो जब था', 'a b c d e f g h'):
+            with self.subTest(phrase=phrase):
+                repeats = max(4, (12 + len(phrase.split()) - 1) // len(phrase.split()))
+                self.assertIsNotNone(worker.repetition_details((' ' + phrase) * repeats))
+        for text in ('yes yes yes', 'वो जब था वो जब था वो जब था', 'a b c d a b c d a b c d'):
+            self.assertIsNone(worker.repetition_details(text))
+
+    def test_trelis_loop_retries_once_at_five_seconds_and_preserves_every_source(self):
+        loop = 'वो जब था ' * 5
+        for duration in (10, 20):
+            with self.subTest(duration=duration):
+                row = self.chunk(0, np.ones(duration * 16000) * 1000, start=2)
+                before = file_digest(self.session / row['file'])
+                calls, gates = [], []
+                def infer(spec, path, config):
+                    calls.append(path)
+                    return {'status': 'ok', 'text': loop if len(calls) == 1 else f'piece number {len(calls)}'}
+                def gate(path, config):
+                    gates.append(path)
+                    return self.keep_gate()
+                result = worker.evaluate_window({'id': 'trelis'}, {}, self.session, [row], 2, 2 + duration,
+                                                self.root / 'loop.wav', infer, gate=gate)
+                self.assertEqual(len(calls), 1 + duration // 5)
+                self.assertEqual(len(gates), len(calls))
+                self.assertEqual(result['original_result']['text'], loop)
+                self.assertNotEqual(result['text'], loop)
+                self.assertTrue(result['alternative']['promoted'])
+                self.assertNotIn('repeated_phrase', result['quality_flags'])
+                self.assertIn('needs_review', result['quality_flags'])
+                pieces = result['alternative']['chunks']
+                self.assertEqual([(p['start_seconds'], p['end_seconds']) for p in pieces],
+                                 [(2 + i, 7 + i) for i in range(0, duration, 5)])
+                for piece in pieces:
+                    self.assertEqual(piece['audio_provenance']['source_chunks'][0]['sha256'], before)
+                    self.assertEqual(piece['audio_provenance']['uncovered_seconds'], 0)
+                    self.assertEqual(len(piece['audio_provenance']['audio_sha256']), 64)
+                    self.assertEqual(piece['source_audio_sha256'], result['audio']['audio_sha256'])
+                    self.assertEqual(piece['audio_provenance']['speech_gate']['model_sha256'], 'a' * 64)
+                self.assertEqual(file_digest(self.session / row['file']), before)
+
+    def test_five_second_loop_does_not_retry_and_ordinary_repetition_is_retained(self):
+        row = self.chunk(0, np.ones(5 * 16000) * 1000)
+        for text in ('yes yes yes', 'वो जब था ' * 5):
+            calls = []
+            def infer(*args):
+                calls.append(args)
+                return {'status': 'ok', 'text': text}
+            result = worker.evaluate_window({'id': 'trelis'}, {}, self.session, [row], 0, 5,
+                                            self.root / 'five.wav', infer, gate=self.keep_gate)
+            self.assertEqual(result['text'], text)
+            self.assertEqual(len(calls), 1)
+            self.assertIsNone(result['alternative'])
+            self.assertEqual('needs_review' in result['quality_flags'], len(text.split()) > 3)
+
+    def test_failed_or_still_looping_retry_keeps_original_and_failed_piece_audio(self):
+        loop = 'वो जब था ' * 5
+        row = self.chunk(0, np.ones(10 * 16000) * 1000)
+        for outcome in ('failed', 'exception', 'persistent'):
+            calls = []
+            def infer(*args):
+                calls.append(args)
+                if len(calls) == 1:
+                    return {'status': 'ok', 'text': loop}
+                if len(calls) == 2 and outcome == 'exception':
+                    raise RuntimeError('synthetic model failure')
+                if len(calls) == 2 and outcome == 'failed':
+                    return {'status': 'failed', 'error': 'synthetic model failure'}
+                return {'status': 'ok', 'text': loop if outcome == 'persistent' else 'speech recovered'}
+            result = worker.evaluate_window({'id': 'trelis'}, {}, self.session, [row], 0, 10,
+                                            self.root / 'failure.wav', infer, gate=self.keep_gate)
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(result['text'], loop)
+            self.assertFalse(result['alternative']['promoted'])
+            self.assertIn('needs_review', result['quality_flags'])
+            self.assertEqual(len(result['alternative']['chunks'][0]['audio_provenance']['audio_sha256']), 64)
+            self.assertIn('repeated_phrase', result['quality_flags'])
+
+    def test_conservative_gate_skip_retains_nonzero_audio_and_unavailable_keeps_words(self):
+        row = self.chunk(0, np.ones(20 * 16000) * 8)
+        before = file_digest(self.session / row['file'])
+        def infer(*args):
+            return {'status': 'ok', 'text': 'Mira'}
+        def no_speech(*args):
+            return {'status': 'ok', 'skip_stt': True, 'raw_max_probability': .01,
+                    'boosted_max_probability': .01, 'model_sha256': 'a' * 64, 'elapsed_seconds': .02}
+        with patch.object(worker, 'transcribe') as model:
+            result = worker.evaluate_window({'id': 'trelis'}, {}, self.session, [row], 0, 20,
+                                            self.root / 'nonzero.wav', model, gate=no_speech)
+            model.assert_not_called()
+        self.assertEqual(result['text'], '')
+        self.assertFalse(result['audio']['digital_silence'])
+        self.assertEqual(result['audio']['speech_gate']['model_sha256'], 'a' * 64)
+        def unavailable(*args):
+            raise RuntimeError('synthetic unavailable classifier')
+        result = worker.evaluate_window({'id': 'trelis'}, {}, self.session, [row], 0, 20,
+                                        self.root / 'nonzero.wav', infer, gate=unavailable)
+        self.assertEqual(result['text'], 'Mira')
+        self.assertIn('speech_gate_unavailable', result['quality_flags'])
+        self.assertEqual(file_digest(self.session / row['file']), before)
+
+    def test_all_empty_or_skipped_retry_does_not_erase_speech_containing_original(self):
+        loop = 'वो जब था ' * 5
+        row = self.chunk(0, np.ones(10 * 16000) * 1000)
+        for skip_retry in (False, True):
+            calls, gates = [], []
+            def infer(*args):
+                calls.append(args)
+                return {'status': 'ok', 'text': loop if len(calls) == 1 else ''}
+            def gate(*args):
+                gates.append(args)
+                report = self.keep_gate()
+                if len(gates) > 1 and skip_retry:
+                    report.update(skip_stt=True, decision='skip', raw_max_probability=.01,
+                                  boosted_max_probability=.01)
+                return report
+            result = worker.evaluate_window({'id': 'trelis'}, {}, self.session, [row], 0, 10,
+                                            self.root / 'empty-retry.wav', infer, gate=gate)
+            self.assertEqual(len(gates), 3)
+            self.assertEqual(len(calls), 1 if skip_retry else 3)
+            self.assertEqual(result['text'], loop)
+            self.assertEqual(result['alternative']['text'], '')
+            self.assertFalse(result['alternative']['promoted'])
+            self.assertIn('needs_review', result['quality_flags'])
+            self.assertIn('repeated_phrase', result['quality_flags'])
+            self.assertEqual(len(result['alternative']['chunks']), 2)
+
+    def test_trelis_retry_checkpoint_keeps_drafts_provenance_and_cursor_on_resume(self):
+        row = self.chunk(0, np.ones(10 * 16000) * 1000)
+        self.journal([row, {'kind': 'capture_stopped', 'at_seconds': 10}, {'kind': 'capture_finalized'}])
+        registry = self.root / 'models.json'
+        write_json(registry, {'models': [{'id': 'trelis', 'decoding': {}}]})
+        config = self.root / 'runtime.json'
+        gate_settings = {'model_path': 'synthetic', 'model_sha256': 'a' * 64, 'threshold': .15}
+        settings = {'registry_path': str(registry), 'models': {'trelis': {}}, 'speech_gate': gate_settings}
+        write_json(config, settings)
+        job = self.root / 'retry-job'; job.mkdir()
+        request = job / 'request.json'
+        write_json(request, {'job_id': 'retry', 'session_dir': str(self.session),
+                             'profile': 'trelis-10', 'language_mode': 'hinglish'})
+        calls = []
+        def infer(spec, path, runtime):
+            self.assertEqual(runtime['speech_gate'], gate_settings)
+            calls.append(path)
+            return {'status': 'ok', 'text': 'वो जब था ' * 5 if len(calls) == 1 else f'recovered piece {len(calls)}'}
+        original = worker.evaluate_window
+        def evaluate(*args):
+            return original(*args, infer=infer, gate=self.keep_gate)
+        with patch.object(socket.socket, 'connect', socket.socket.connect), patch.object(socket.socket, 'connect_ex', socket.socket.connect_ex), patch.object(socket, 'create_connection', socket.create_connection), patch.object(worker, 'parent_alive', return_value=True), patch.object(worker, 'evaluate_window', side_effect=evaluate):
+            first = worker.run(config, request)
+            second = worker.run(config, request)
+        self.assertEqual(first['state'], 'complete')
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(first['segments'], second['segments'])
+        self.assertEqual(second['cursors']['microphone'], 10)
+        self.assertEqual(second['segments'][0]['recognition_original']['text'], 'वो जब था ' * 5)
+        self.assertTrue(second['segments'][0]['alternative']['promoted'])
+        self.assertEqual(second['identity']['speech_gate'], gate_settings)
+        write_json(config, {**settings, 'speech_gate': {**gate_settings, 'threshold': .1}})
+        with self.assertRaisesRegex(ValueError, 'Cannot resume changed'):
+            worker.run(config, request)
+
     def test_checkpoint_resume_does_not_duplicate_and_identity_changes_fail(self):
         row = self.chunk(0,np.zeros(16000))
         self.journal([row,{'kind':'capture_stopped','at_seconds':1},{'kind':'capture_finalized'}])

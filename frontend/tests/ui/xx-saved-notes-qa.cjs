@@ -30,6 +30,11 @@ async function main() {
   try {
     await installFixture(page);
     await page.addInitScript(() => {
+      window.qaWorkspace().segment_metadata.first = {
+        source_track: 'system', timestamp_kind: 'audio_window', quality_flags: ['retry_applied', 'needs_review'],
+        original_recognition_text: 'वो जब था '.repeat(5),
+        alternative: { text: 'Welcome back, everyone. आज Project Willow की workshop plan करते हैं. Maya, would you like to walk us through the new sketchbook idea?', promoted: true, requires_review: true },
+      };
       const invoke = window.__TAURI_INTERNALS__.invoke;
       window.qaSaveDelay = 0; window.qaFailSave = false; window.qaSaveFailures = 0;
       window.__TAURI_INTERNALS__.invoke = async (command, args = {}) => {
@@ -81,6 +86,20 @@ async function main() {
       await page.getByRole('button', { name: 'Hide transcript', exact: true }).click();
       report.checks.push({ viewport: `${width}x${height}`, layout });
     }
+
+    await page.getByRole('button', { name: 'Show transcript', exact: true }).click();
+    const selectedRetry = transcript.locator('article').first();
+    await selectedRetry.getByText('Processing checks', { exact: true }).click();
+    await selectedRetry.getByText('A shorter-window retry was selected for this transcript. Review it against the recording.', { exact: true }).waitFor();
+    assert.equal(await selectedRetry.getByText('A shorter-window retry is available for comparison. It has not replaced the original recognition.', { exact: true }).count(), 0);
+    await selectedRetry.getByText('Recognition before shorter retry', { exact: true }).click();
+    await selectedRetry.getByText('वो जब था '.repeat(5).trim(), { exact: true }).waitFor();
+    const legacyRetry = transcript.locator('article').nth(2);
+    await legacyRetry.getByText('Processing checks', { exact: true }).click();
+    await legacyRetry.getByText('A shorter-window retry is available for comparison. It has not replaced the original recognition.', { exact: true }).waitFor();
+    await legacyRetry.getByText('A shorter-window comparison is available for review.', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Hide transcript', exact: true }).click();
+    report.checks.push('Promoted retries show the preserved pre-retry recognition; legacy comparison-only retries keep accurate unchanged wording');
 
     await notes.fill('Checked fictional notes, saved without pressing a button.');
     await page.waitForFunction(() => window.qaWorkspace().notes === 'Checked fictional notes, saved without pressing a button.');
