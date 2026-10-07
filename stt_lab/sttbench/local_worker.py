@@ -171,7 +171,8 @@ def review_flags(text: str, audio: dict, duration: float) -> list[str]:
     return flags
 
 
-def _recognize_window(spec, config, session, rows, start, end, target, infer, speech_gate, gate):
+def _recognize_window(spec, config, session, rows, start, end, target, infer, speech_gate, gate,
+                      *, allow_gate_skip=True):
     audio = materialize(session, rows, start, end, target)
     if audio['digital_silence']:
         return ({'status': 'ok', 'text': '', 'segments': [],
@@ -185,6 +186,11 @@ def _recognize_window(spec, config, session, rows, start, end, target, infer, sp
         except Exception as exc:
             assessment = {'status': 'unavailable', 'skip_stt': False, 'decision': 'keep',
                           'warning': 'speech_gate_unavailable', 'error': str(exc)}
+        if not allow_gate_skip and assessment.get('skip_stt') is True:
+            # A newly cut overlap fringe must not silently erase prior words.
+            # Record the classifier's suggestion while retaining its raw audio.
+            assessment = {**assessment, 'skip_stt': False, 'decision': 'keep',
+                          'skip_overridden_for_overlap_fringe': True}
         audio['speech_gate'] = assessment
         if assessment.get('status') == 'ok' and assessment.get('skip_stt') is True:
             return ({'status': 'ok', 'text': '', 'segments': [],
@@ -200,21 +206,31 @@ def _recognize_window(spec, config, session, rows, start, end, target, infer, sp
     return result, audio
 
 
-def evaluate_window(spec, config, session, rows, start, end, target, infer=transcribe,
-                    speech_gate=None, gate=assess_window):
-    if speech_gate is None:
-        speech_gate = config.get('speech_gate')
-    result, audio = _recognize_window(spec, config, session, rows, start, end, target,
-                                      infer, speech_gate, gate)
-    if result['status'] != 'ok':
-        raise RuntimeError(result.get('error', 'Local model failed'))
-    flags = review_flags(result['text'], audio, end-start)
+def recognition_flags(result, audio, duration):
+    flags = review_flags(result.get('text', ''), audio, duration)
+    if result.get('status') != 'ok':
+        flags.append('recognition_failed')
+    if result.get('decoding_diagnostics', {}).get('token_cap_reached') is True:
+        flags.append('token_cap_reached')
+    return flags
+
+
+def needs_context_recovery(result, flags):
+    return any(flag in flags for flag in ('repeated_phrase', 'token_cap_reached'))
+
+
+def _shorter_retry(spec, config, session, rows, start, end, target, evaluated, infer,
+                   speech_gate, gate, *, retry_piece=None, allow_single_piece=False):
+    """Bounded core-only fallback; complete nonempty pieces remain reviewable."""
+    evaluated = copy.deepcopy(evaluated)
+    result, audio = evaluated['result'], evaluated['audio']
+    original_result, flags = evaluated['original_result'], evaluated['quality_flags']
     alternative = None
-    original_result = copy.deepcopy(result)
     trelis = spec.get('id') == 'trelis'
-    repeated = 'repeated_phrase' in flags
+    triggered = trelis and needs_context_recovery(result, flags)
     retry_seconds = 5 if trelis else 10
-    should_retry = ((trelis and repeated) or 'suspiciously_sparse_text' in flags) and end-start > retry_seconds
+    should_retry = (triggered or 'suspiciously_sparse_text' in flags) and (
+        end-start > retry_seconds or allow_single_piece)
     if should_retry:
         # One bounded retry, using disjoint original-source windows. There is no
         # recursive retry: even a looping 5s piece is preserved for review.
@@ -222,14 +238,17 @@ def evaluate_window(spec, config, session, rows, start, end, target, infer=trans
         for index, cursor in enumerate(range(round(start*16000), round(end*16000), retry_seconds*16000)):
             left, right = cursor / 16000, min(end, (cursor + retry_seconds*16000) / 16000)
             retry = target.with_name(target.stem + f'-retry-{index}.wav')
-            try:
-                candidate, candidate_audio = _recognize_window(spec, config, session, rows, left, right, retry,
-                                                               infer, speech_gate, gate)
-            except Exception as exc:
-                candidate = {'status': 'failed', 'text': '', 'error': str(exc)}
-                candidate_audio = None
-            candidate_flags = (review_flags(candidate['text'], candidate_audio, right-left)
-                               if candidate.get('status') == 'ok' else ['recognition_failed'])
+            if retry_piece is not None:
+                candidate, candidate_audio = retry_piece(left, right, retry)
+            else:
+                try:
+                    candidate, candidate_audio = _recognize_window(spec, config, session, rows, left, right, retry,
+                                                                   infer, speech_gate, gate)
+                except Exception as exc:
+                    candidate = {'status': 'failed', 'text': '', 'error': str(exc)}
+                    candidate_audio = None
+            candidate_flags = (recognition_flags(candidate, candidate_audio, right-left)
+                               if candidate_audio is not None else ['recognition_failed'])
             pieces.append({'start_seconds': left, 'end_seconds': right, 'timestamp_kind': 'audio_window',
                            'source_audio_sha256': audio['audio_sha256'], 'audio_provenance': candidate_audio,
                            'quality_flags': candidate_flags, 'result': candidate})
@@ -237,12 +256,13 @@ def evaluate_window(spec, config, session, rows, start, end, target, infer=trans
         joined = '\n\n'.join(p['result'].get('text', '') for p in pieces if p['result'].get('text'))
         resolved = all_ok and not repetition_details(joined) and not any(
             'repeated_phrase' in p['quality_flags'] for p in pieces)
-        # An empty recovery cannot establish that a speech-containing original
-        # should be erased; preserve both drafts and ask for review instead.
-        promoted = trelis and repeated and resolved and bool(joined.strip())
+        # Select a completed, nonempty shorter retry even if a piece still loops,
+        # so useful speech from the other pieces is not hidden by the original.
+        # Failed or entirely empty retries cannot replace a speech-containing draft.
+        promoted = triggered and all_ok and bool(joined.strip())
         alternative = {'text': joined, 'chunks': pieces, 'requires_review': True, 'promoted': bool(promoted),
                        'all_chunks_ok': all_ok, 'long_repetition_resolved': bool(resolved),
-                       'reason': ('Long repeated phrase; bounded shorter-window retry' if repeated
+                       'reason': ('Repeated or token-capped core; bounded shorter-window retry' if triggered
                                   else 'Energy/text heuristic, not proof of missing speech')}
         if promoted:
             result = {'status': 'ok', 'text': joined, 'segments': [],
@@ -251,17 +271,231 @@ def evaluate_window(spec, config, session, rows, start, end, target, infer=trans
                       'timing': {'initial': original_result.get('timing', {}),
                                  'retries': [p['result'].get('timing', {}) for p in pieces]}}
             flags = review_flags(joined, audio, end-start)
+            if any('token_cap_reached' in p['quality_flags'] for p in pieces):
+                flags.append('token_cap_reached')
             flags.extend(['retry_applied', 'needs_review'])
         else:
             flags.append('retry_available' if all_ok else 'retry_failed')
-            if trelis and repeated:
+            if triggered:
                 flags.append('needs_review')
         if any('speech_gate_unavailable' in p['quality_flags'] for p in pieces) and 'speech_gate_unavailable' not in flags:
             flags.append('speech_gate_unavailable')
-    elif trelis and repeated:
+    elif triggered:
         flags.append('needs_review')
-    return {'text': result['text'], 'result': result, 'original_result': original_result, 'audio': audio,
+    return {'text': result.get('text', ''), 'result': result, 'original_result': original_result, 'audio': audio,
             'quality_flags': flags, 'alternative': alternative}
+
+
+def evaluate_window(spec, config, session, rows, start, end, target, infer=transcribe,
+                    speech_gate=None, gate=assess_window, *, defer_recovery=False):
+    if speech_gate is None:
+        speech_gate = config.get('speech_gate')
+    result, audio = _recognize_window(spec, config, session, rows, start, end, target,
+                                      infer, speech_gate, gate)
+    trelis = spec.get('id') == 'trelis'
+    if result.get('status') != 'ok':
+        raise RuntimeError(result.get('error', 'Local model failed'))
+    flags = recognition_flags(result, audio, end-start)
+    evaluated = {'text': result.get('text', ''), 'result': result, 'original_result': copy.deepcopy(result),
+                 'audio': audio, 'quality_flags': flags, 'alternative': None}
+    if trelis and defer_recovery and needs_context_recovery(result, flags):
+        flags.extend(['context_retry_pending', 'needs_review'])
+        return evaluated
+    return _shorter_retry(spec, config, session, rows, start, end, target, evaluated,
+                          infer, speech_gate, gate)
+
+
+def context_window_bounds(start, end, committed_end, finalized):
+    """Thirty-second neighborhood, with no invented future capture samples."""
+    start_sample, end_sample = round(start*16000), round(end*16000)
+    padding = max(0, 30*16000 - (end_sample-start_sample))
+    # Odd padding cannot be rounded independently at both edges: that could
+    # create a 480001-sample WAV and exceed the model's strict 30s limit.
+    left = max(0, start_sample-padding//2) / 16000
+    desired_right = (end_sample + padding-padding//2) / 16000
+    # A finalized primary may already include a verified trailing capture gap.
+    # Preserve that core range, but never add new context beyond committed audio.
+    limit = max(end, committed_end)
+    right = min(desired_right, limit) if finalized else desired_right
+    ready = finalized or committed_end >= desired_right - 1/16000
+    return left, right, desired_right, ready
+
+
+def _segment_record(segment_id, track, profile, model, start, end, evaluated):
+    return {'id': segment_id, 'text': evaluated['text'], 'start_seconds': start,
+            'end_seconds': end, 'source_track': track, 'timestamp_kind': 'audio_window', 'speaker': None,
+            'model_id': model, 'profile': profile, 'quality_flags': evaluated['quality_flags'],
+            'alternative': evaluated['alternative'], 'audio_provenance': evaluated['audio'],
+            'recognition': evaluated['result'], 'recognition_original': evaluated['original_result']}
+
+
+def _selection_changed(status):
+    status['segments_revision'] = status.get('segments_revision', 0) + 1
+
+
+def _archive_segments(status, originals, replacements):
+    revision = status.get('segments_revision', 0) + 1
+    archive = status.setdefault('superseded_segments', [])
+    for original in originals:
+        archive.append({**copy.deepcopy(original), 'superseded_by': list(replacements),
+                        'superseded_at_segments_revision': revision})
+
+
+def _pending_recovery(status, track):
+    return next((segment for segment in status['segments'] if segment['source_track'] == track
+                 and segment.get('recovery', {}).get('state') == 'waiting_for_context'), None)
+
+
+class _RecoveryInterrupted(Exception):
+    """Keep a provisional core and completed attempts when capture is stopped."""
+
+
+def recover_pending_segment(status, status_path, job, spec, config, session, rows, track,
+                             finalized, *, infer=transcribe, gate=assess_window, keep_running=lambda: True):
+    """Replace a complete covered range, or select a bounded core-only fallback.
+
+    We have no aligned word timestamps: trimming text would guess which words
+    belong to an overlap. Re-recognize every untouched fringe, or retain all
+    original segments. Checkpoint attempts before publishing a replacement.
+    """
+    core = _pending_recovery(status, track)
+    if core is None:
+        return False
+    recovery = core['recovery']
+    start, end = recovery['core_start_seconds'], recovery['core_end_seconds']
+    committed_end = max((row['end_seconds'] for row in rows), default=0)
+    left, right, desired_right, ready = context_window_bounds(start, end, committed_end, finalized)
+    if not ready:
+        return False
+    recovery.update(context_start_seconds=left, context_end_seconds=right,
+                    desired_context_end_seconds=desired_right)
+    speech_gate = config.get('speech_gate')
+    core_hash = core['audio_provenance']['audio_sha256']
+
+    def attempt(kind, begin, finish, path, *, superseded=None, source_hash=core_hash):
+        if not keep_running():
+            raise _RecoveryInterrupted()
+        saved = next((item for item in recovery['attempts'] if item['kind'] == kind
+                      and item['start_seconds'] == begin and item['end_seconds'] == finish
+                      and item.get('superseded_segment_id') == superseded), None)
+        if saved is not None:
+            # The immutable result can be reused only against the same source
+            # bytes and derived waveform, including on a interrupted restart.
+            verified = materialize(session, rows, begin, finish, path)
+            if verified['audio_sha256'] != saved['audio_provenance']['audio_sha256']:
+                raise ValueError('Recovery audio changed since its checkpoint')
+            return saved
+        result, audio = _recognize_window(spec, config, session, rows, begin, finish, path,
+                                          infer, speech_gate, gate,
+                                          allow_gate_skip=kind != 'overlap_fringe')
+        item = {'kind': kind, 'start_seconds': begin, 'end_seconds': finish,
+                'timestamp_kind': 'audio_window', 'source_audio_sha256': source_hash,
+                'audio_provenance': audio, 'result': result,
+                'quality_flags': recognition_flags(result, audio, finish-begin)}
+        if superseded is not None:
+            item['superseded_segment_id'] = superseded
+        recovery['attempts'].append(item)
+        status.update(state='running', phase='recovering_context')
+        status['updated_at'] = datetime.now(timezone.utc).isoformat()
+        write_json(status_path, status)
+        return item
+
+    def clean(item):
+        return item['result'].get('status') == 'ok' and not any(
+            flag in item['quality_flags'] for flag in ('repeated_phrase', 'token_cap_reached',
+                                                       'suspiciously_sparse_text'))
+
+    expanded = left < start-1/16000 or right > end+1/16000
+    context = None
+    if expanded:
+        path = job/'windows'/f'{track}-context-{round(left*16000)}-{round(right*16000)}.wav'
+        context = attempt('context_window_retry', left, right, path)
+    overlaps = [segment for segment in status['segments'] if segment['source_track'] == track
+                and segment['start_seconds'] < right and segment['end_seconds'] > left]
+    fringes = []
+    promotable = context is not None and clean(context) and bool(context['result'].get('text', '').strip())
+    if promotable:
+        for previous in overlaps:
+            residuals = []
+            if previous['start_seconds'] < left:
+                residuals.append((previous['start_seconds'], min(left, previous['end_seconds'])))
+            if previous['end_seconds'] > right:
+                residuals.append((max(right, previous['start_seconds']), previous['end_seconds']))
+            for begin, finish in residuals:
+                path = job/'windows'/f'{track}-fringe-{round(begin*16000)}-{round(finish*16000)}.wav'
+                fringe = attempt('overlap_fringe', begin, finish, path, superseded=previous['id'],
+                                 source_hash=previous['audio_provenance']['audio_sha256'])
+                # An empty nonzero fringe is uncertain even when VAD calls it
+                # nonspeech; it cannot erase an untouched part of prior speech.
+                if not clean(fringe) or (not fringe['result'].get('text', '').strip()
+                                          and not fringe['audio_provenance']['digital_silence']):
+                    promotable = False
+                    break
+                fringes.append((previous, fringe))
+            if not promotable:
+                break
+    if promotable:
+        if not keep_running():
+            raise _RecoveryInterrupted()
+        originals = copy.deepcopy(overlaps)
+        recovery.update(state='complete', method='context_window_retry')
+        replaced_ids = [segment['id'] for segment in overlaps]
+        alternative = {'text': context['result']['text'], 'chunks': [copy.deepcopy(context)],
+                       'requires_review': True, 'promoted': True, 'all_chunks_ok': True,
+                       'long_repetition_resolved': True, 'reason': 'Bounded context retry with complete overlap replacement'}
+        evaluated = {'text': context['result']['text'], 'result': context['result'],
+                     'original_result': core['recognition_original'], 'audio': context['audio_provenance'],
+                     'quality_flags': [*context['quality_flags'], 'retry_applied', 'needs_review'],
+                     'alternative': alternative}
+        context_id = f"{status['job_id']}-{track}-c-{round(left*16000)}-{round(right*16000)}"
+        selected = _segment_record(context_id, track, core['profile'], core['model_id'], left, right, evaluated)
+        selected.update(replaces_segment_ids=replaced_ids, recovery=copy.deepcopy(recovery))
+        replacements = [selected]
+        for previous, fringe in fringes:
+            begin, finish = fringe['start_seconds'], fringe['end_seconds']
+            fringe_evaluated = {'text': fringe['result'].get('text', ''), 'result': fringe['result'],
+                                'original_result': previous['recognition'], 'audio': fringe['audio_provenance'],
+                                'quality_flags': [*fringe['quality_flags'], 'retry_applied', 'needs_review'],
+                                'alternative': {**alternative, 'text': fringe['result'].get('text', ''),
+                                                'chunks': [copy.deepcopy(fringe)],
+                                                'reason': 'Untouched overlap fringe re-recognized without text trimming'}}
+            fringe_id = f"{status['job_id']}-{track}-f-{round(begin*16000)}-{round(finish*16000)}"
+            record = _segment_record(fringe_id, track, previous['profile'], previous['model_id'],
+                                     begin, finish, fringe_evaluated)
+            record.update(replaces_segment_ids=[previous['id']], recovery={**copy.deepcopy(recovery),
+                          'original_segment_id': previous['id'], 'original_start_seconds': previous['start_seconds'],
+                          'original_end_seconds': previous['end_seconds']})
+            replacements.append(record)
+        _archive_segments(status, originals, [segment['id'] for segment in replacements])
+        status['segments'] = [segment for segment in status['segments'] if segment['id'] not in replaced_ids] + replacements
+        status['segments'].sort(key=lambda segment: (segment['start_seconds'], segment['source_track'], segment['id']))
+        status['cursors'][track] = max(status['cursors'].get(track, 0), right)
+        _selection_changed(status)
+        return True
+
+    evaluated = {'text': core['text'], 'result': core['recognition'],
+                 'original_result': core['recognition_original'], 'audio': core['audio_provenance'],
+                 'quality_flags': recognition_flags(core['recognition'], core['audio_provenance'], end-start),
+                 'alternative': None}
+    def piece(begin, finish, path):
+        item = attempt('shorter_window_retry', begin, finish, path)
+        return item['result'], item['audio_provenance']
+    target = job/'windows'/f'{track}-{round(start*16000)}.wav'
+    fallback = _shorter_retry(spec, config, session, rows, start, end, target, evaluated,
+                              infer, speech_gate, gate, retry_piece=piece, allow_single_piece=expanded)
+    if not keep_running():
+        raise _RecoveryInterrupted()
+    promoted = fallback['alternative'] is not None and fallback['alternative']['promoted']
+    original_snapshot = copy.deepcopy(core)
+    recovery.update(state='complete', method='shorter_window_retry' if promoted else 'original')
+    replacement = _segment_record(core['id'], track, core['profile'], core['model_id'], start, end, fallback)
+    replacement['recovery'] = copy.deepcopy(recovery)
+    if promoted:
+        replacement['replaces_segment_ids'] = [core['id']]
+        _archive_segments(status, [original_snapshot], [core['id']])
+    status['segments'][status['segments'].index(core)] = replacement
+    _selection_changed(status)
+    return True
 
 
 @contextlib.contextmanager
@@ -334,11 +568,14 @@ def run_locked(config_path: Path, request_path: Path):
     status_path = job/'status.json'
     status = read_json(status_path) if status_path.exists() else {
         'version': 1, 'job_id': request['job_id'], 'session_dir': str(session), 'profile': request['profile'],
-        'state': 'running', 'segments': [], 'cursors': {}, 'identity': identity, 'identity_sha256': identity_hash,
+        'state': 'running', 'segments': [], 'segments_revision': 0, 'superseded_segments': [],
+        'cursors': {}, 'identity': identity, 'identity_sha256': identity_hash,
         'processed_audio_seconds': 0, 'available_audio_seconds': 0, 'backlog_seconds': 0,
         'live_qualified': False, 'speaker_identification': 'unavailable', 'timestamp_kind': 'audio_window'}
     if status.get('identity_sha256') != identity_hash:
         raise ValueError('Cannot resume changed model, input or worker identity')
+    status.setdefault('segments_revision', 0)
+    status.setdefault('superseded_segments', [])
     # Network calls are never needed by this app worker. Native CLI also has no service URL.
     def no_network(*args, **kwargs):
         raise OSError('Local transcription worker cannot connect to a network')
@@ -368,25 +605,40 @@ def run_locked(config_path: Path, request_path: Path):
             status['capture_event_count'] = len(events)
             # Round-robin tracks; one bounded window per track per pass.
             for track in TRACKS:
-                cursor = status['cursors'].get(track, 0)
-                limit = available[track]
-                if limit - cursor < seconds - .001 and not finalized:
-                    continue
-                if limit <= cursor + 1/16000:
-                    continue
-                end = min(cursor + seconds, limit)
-                segment_id = f"{request['job_id']}-{track}-{round(cursor*16000)}"
-                target = job/'windows'/f'{track}-{round(cursor*16000)}.wav'
-                status['state'] = 'running'
-                write_json(status_path, status)
                 window_runtime = {**runtime, 'speech_gate': config.get('speech_gate')} if model == 'trelis' else runtime
-                evaluated = evaluate_window(spec, window_runtime, session, rows[track], cursor, end, target)
-                status['segments'].append({'id': segment_id, 'text': evaluated['text'], 'start_seconds': cursor,
-                    'end_seconds': end, 'source_track': track, 'timestamp_kind': 'audio_window', 'speaker': None,
-                    'model_id': model, 'profile': request['profile'], 'quality_flags': evaluated['quality_flags'],
-                    'alternative': evaluated['alternative'], 'audio_provenance': evaluated['audio'],
-                    'recognition': evaluated['result'], 'recognition_original': evaluated['original_result']})
-                status['cursors'][track] = end
+                if _pending_recovery(status, track) is not None:
+                    if not recover_pending_segment(status, status_path, job, spec, window_runtime,
+                            session, rows[track], track, finalized, infer=transcribe, gate=assess_window,
+                            keep_running=lambda: not stop.exists() and parent_alive()):
+                        continue
+                else:
+                    cursor = status['cursors'].get(track, 0)
+                    limit = available[track]
+                    if limit - cursor < seconds - .001 and not finalized:
+                        continue
+                    if limit <= cursor + 1/16000:
+                        continue
+                    end = min(cursor + seconds, limit)
+                    segment_id = f"{request['job_id']}-{track}-{round(cursor*16000)}"
+                    target = job/'windows'/f'{track}-{round(cursor*16000)}.wav'
+                    status.update(state='running', phase='transcribing')
+                    write_json(status_path, status)
+                    evaluated = evaluate_window(spec, window_runtime, session, rows[track], cursor,
+                                                 end, target, infer=transcribe, gate=assess_window,
+                                                 defer_recovery=model == 'trelis')
+                    segment = _segment_record(segment_id, track, request['profile'], model, cursor, end, evaluated)
+                    if model == 'trelis' and needs_context_recovery(evaluated['result'], evaluated['quality_flags']):
+                        committed_end = max((row['end_seconds'] for row in rows[track]), default=0)
+                        left, right, desired_right, _ = context_window_bounds(cursor, end, committed_end, finalized)
+                        segment['recovery'] = {'state': 'waiting_for_context', 'method': 'pending',
+                            'core_segment_id': segment_id, 'core_start_seconds': cursor, 'core_end_seconds': end,
+                            'context_start_seconds': left, 'context_end_seconds': right,
+                            'desired_context_end_seconds': desired_right, 'requires_review': True, 'attempts': []}
+                    status['segments'].append(segment)
+                    status['cursors'][track] = end
+                    _selection_changed(status)
+                # Publish the complete canonical change before further work.
+                write_json(status_path, status)
                 # Inference can be slower than capture; refresh the backlog clock.
                 fresh_rows, fresh_finalized, fresh_end, _ = journal_snapshot(session)
                 fresh_available = {t: (fresh_end if fresh_finalized and fresh_rows[t] else max((r['end_seconds'] for r in fresh_rows[t]), default=0)) for t in TRACKS}
@@ -397,10 +649,17 @@ def run_locked(config_path: Path, request_path: Path):
                 write_json(status_path, status)
                 progressed = True
                 if stop.exists() or not parent_alive(): break
-            if finalized and all(status['cursors'].get(t, 0) >= available[t]-1/16000 for t in TRACKS):
-                status['state'] = 'complete'; break
+            if stop.exists() or not parent_alive():
+                status['state'] = 'stopped'; break
+            if finalized and not any(_pending_recovery(status, t) for t in TRACKS) and all(
+                    status['cursors'].get(t, 0) >= available[t]-1/16000 for t in TRACKS):
+                status.update(state='complete', phase='complete'); break
             if not progressed:
-                status['state'] = 'waiting_for_audio'; write_json(status_path, status); time.sleep(.5)
+                phase = 'waiting_for_context' if any(_pending_recovery(status, t) for t in TRACKS) else 'waiting_for_audio'
+                status.update(state='waiting_for_audio', phase=phase)
+                write_json(status_path, status); time.sleep(.5)
+    except _RecoveryInterrupted:
+        status['state'] = 'stopped'
     except Exception as exc:
         status.update(state='failed', error=str(exc))
     finally:

@@ -6,6 +6,7 @@ import { recordingTime } from '@/lib/transcript-workspace';
 import { profileChunkSeconds, trelisProfile } from '@/lib/local-transcription-workflow';
 import { usePermissionCheck } from '@/hooks/usePermissionCheck';
 import { PermissionWarning } from '@/components/PermissionWarning';
+import { TranscriptProcessingChecks } from '@/components/TranscriptProcessingChecks';
 
 export function LiveTranscriptPanel() {
   const { state } = useLocalWorkflow();
@@ -20,7 +21,7 @@ export function LiveTranscriptPanel() {
   const isLegacyDraft = run?.role === 'live-draft';
   const chunkSeconds = profileChunkSeconds(trelisProfile(run?.preferences.profile ?? state.preferences.profile));
   const caption = isFallback ? 'Apex fallback · separate version · Roman Hinglish' : isLegacyDraft ? 'Apex live draft · Trelis final after the call' : `Trelis · ${chunkSeconds}-second windows plus processing · original Hindi + English script`;
-  const segments = [...(run?.job?.segments ?? [])].filter(segment => segment.text.trim()).sort((a, b) => (a.start_seconds ?? 0) - (b.start_seconds ?? 0) || a.source_track.localeCompare(b.source_track));
+  const segments = [...(run?.job?.segments ?? [])].filter(segment => segment.text.trim()).sort((a, b) => (a.start_seconds ?? 0) - (b.start_seconds ?? 0) || (a.source_track ?? '').localeCompare(b.source_track ?? ''));
   return <section className="xx-live-panel custom-scrollbar" aria-label="Live transcript">
     {!segments.length ? <div className="xx-live-empty">
       <div className="mb-6 flex h-12 w-12 items-center justify-center rounded-2xl bg-[var(--xx-canvas)] text-[var(--xx-accent)]">{isRecording ? <AudioLines size={23} /> : <NotebookPen size={23} />}</div>
@@ -31,8 +32,21 @@ export function LiveTranscriptPanel() {
       {!isRecording && <div className="mt-7 flex flex-wrap gap-x-5 gap-y-2 text-xs text-[var(--xx-muted)]"><span className="flex items-center gap-1.5"><Mic size={13} />Record on your laptop</span><span className="flex items-center gap-1.5"><Check size={13} />Review at your pace</span></div>}
       {!isRecording && !permissions.isChecking && <div className="mt-5"><PermissionWarning hasMicrophone={permissions.hasMicrophone} hasSystemAudio={permissions.hasSystemAudio} onRecheck={permissions.checkPermissions} isRechecking={permissions.isChecking} /></div>}
     </div> : <div className="mx-auto max-w-3xl">
-      <header className="mb-5"><p className="xx-eyebrow">{isFallback ? 'Apex fallback' : isPaused ? 'Paused' : run?.job?.state === 'complete' ? 'Final transcript' : isRecording ? 'Live transcript' : 'Finishing transcript'}</p><h2 className="xx-heading text-3xl mt-2">The conversation so far</h2><p className="mt-2 text-xs text-[var(--xx-muted)]">{caption}</p></header>
-      {segments.map(segment => <article className="xx-live-row" key={segment.id}><div className="space-y-2 text-[11px] text-[var(--xx-muted)]"><span className="font-mono">{recordingTime(segment.start_seconds)}</span><span className="block">{segment.source_track}</span></div><div><p className="whitespace-pre-wrap break-words text-base leading-8">{segment.text}</p>{!!segment.quality_flags?.length && <span className="mt-2 inline-block text-xs text-amber-800">Review suggested</span>}</div></article>)}
+      <header className="mb-5"><p className="xx-eyebrow">{isFallback ? 'Apex fallback' : isPaused ? 'Paused' : run?.job?.state === 'complete' ? 'Final transcript' : isRecording ? 'Live transcript' : 'Finishing transcript'}</p><h2 className="xx-heading text-3xl mt-2">The conversation so far</h2><p className="mt-2 text-xs text-[var(--xx-muted)]">{caption}</p><p className="xx-transcript-source-help mt-2">Left: computer audio · Right: microphone. Labels identify audio sources, not people.</p></header>
+      {segments.map(segment => {
+        const channel = segment.source_track === 'system' || segment.source_track === 'microphone' ? segment.source_track : 'unknown';
+        const sourceLabel = channel === 'system' ? 'Computer audio' : channel === 'microphone' ? 'Microphone' : 'Source unavailable';
+        return <article key={segment.id} data-segment-id={segment.id} data-source-channel={channel} aria-label={`${sourceLabel} at ${recordingTime(segment.start_seconds)}`} className={`xx-transcript-message xx-transcript-message-${channel} space-y-2`}>
+          <div className="xx-transcript-message-meta flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-[var(--xx-muted)]">
+            <span className="font-mono">{recordingTime(segment.start_seconds)}</span>
+            {segment.recovery?.method === 'context_window_retry' && segment.end_seconds != null && <span className="font-mono -ml-2">–{recordingTime(segment.end_seconds)}</span>}
+            <span className="xx-transcript-source-label" title="Recording source; this label does not identify a person.">{sourceLabel}</span>
+            {(!!segment.quality_flags?.length || segment.recovery?.requires_review) && <span className="text-amber-800">Review suggested</span>}
+          </div>
+          <p className="xx-transcript-message-text whitespace-pre-wrap text-[15px] leading-[1.85]">{segment.text}</p>
+          <TranscriptProcessingChecks metadata={{ ...segment, original_recognition_text: segment.original_recognition_text ?? segment.recognition_original?.text }} startSeconds={segment.start_seconds} endSeconds={segment.end_seconds} />
+        </article>;
+      })}
       <p className="mt-5 text-xs leading-5 text-[var(--xx-muted)]">Times mark audio windows. Microphone and system labels identify tracks; individual speaker suggestions are prepared after the call.</p>
     </div>}
   </section>;

@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import wave
+import zlib
 
 from .assets import local_path, verify_conversion_provenance, verify_model_assets, verify_openvino_assets
 
@@ -191,6 +192,44 @@ def _hf_whisper(spec, audio, raw, config, result):
     _generate_whisper(spec, raw, config, result, processor, model, torch, np, device, dtype, decoding)
 
 
+class _GenerationObserver:
+    """Read sequence length/EOS without changing logits or stopping generation."""
+    def __init__(self, maximum, eos_token_id):
+        self.maximum = maximum
+        self.eos_ids = set(eos_token_id if isinstance(eos_token_id, (list, tuple)) else [eos_token_id])
+        self.prefix_length = None
+        self.last_length = 0
+        self.generated_token_count = None
+        self.ended_with_eos = None
+        self.token_cap_reached = False
+        self.generation_calls_observed = 0
+
+    def __call__(self, input_ids, scores, **kwargs):
+        length = int(input_ids.shape[-1])
+        if self.prefix_length is None or length <= self.last_length:
+            # Called after the first new token, including any actual decoder prompt.
+            self.prefix_length = length - 1
+            self.generation_calls_observed += 1
+        self.last_length = length
+        self.generated_token_count = length - self.prefix_length
+        self.ended_with_eos = int(input_ids[0, -1]) in self.eos_ids
+        self.token_cap_reached |= self.generated_token_count >= self.maximum and not self.ended_with_eos
+        return False
+
+    def diagnostics(self, text):
+        raw = text.encode('utf-8')
+        return {'generated_token_count': self.generated_token_count,
+                'max_new_tokens': self.maximum, 'token_cap_reached': self.token_cap_reached,
+                'ended_with_eos': self.ended_with_eos,
+                'generation_calls_observed': self.generation_calls_observed,
+                'reference_text_zlib_ratio': len(raw) / len(zlib.compress(raw)),
+                'compression_definition': 'UTF-8 text bytes divided by zlib-compressed text bytes',
+                'avg_logprob': None, 'no_speech_probability': None,
+                'confidence_status': 'unavailable',
+                'confidence_note': 'Decoder probability scores are not collected by the app and never discard text.',
+                'observer_changes_generation': False}
+
+
 def _generate_whisper(spec, raw, config, result, processor, model, torch, np, device, dtype, decoding):
     """One decoder implementation for HF and OpenVINO; keep prompts identical."""
     inference_start = time.perf_counter()
@@ -246,6 +285,8 @@ def _generate_whisper(spec, raw, config, result, processor, model, torch, np, de
         "num_beams": num_beams, "max_new_tokens": kwargs["max_new_tokens"],
         "return_timestamps": kwargs["return_timestamps"],
     }
+    observer = _GenerationObserver(kwargs['max_new_tokens'], getattr(generation, 'eos_token_id', None))
+    kwargs['stopping_criteria'] = [observer]
     with torch.inference_mode():
         output = model.generate(input_features=features, **kwargs)
     decoded_ids = output[0]
@@ -272,6 +313,7 @@ def _generate_whisper(spec, raw, config, result, processor, model, torch, np, de
     else:
         result["text"] = processor.tokenizer.decode(decoded_ids, skip_special_tokens=True).strip()
         result["warnings"].append("This decoding mode returned text only; segment/word timestamps were not measured.")
+    result['decoding_diagnostics'] = observer.diagnostics(result['text'])
     result["timing"]["inference_seconds"] = time.perf_counter() - inference_start
 
 

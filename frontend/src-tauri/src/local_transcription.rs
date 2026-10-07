@@ -1,7 +1,8 @@
 //! Isolated local STT jobs. Recorder health never depends on a model process.
-use std::{collections::HashMap, fs, path::{Path, PathBuf}, process::{Child, Command, Stdio}, sync::Mutex};
+use std::{collections::{HashMap, HashSet}, fs, path::{Path, PathBuf}, process::{Child, Command, Stdio}, sync::Mutex};
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use crate::{local_workspace::{data_root, valid_id}, state::AppState};
 
 static CHILDREN: Lazy<Mutex<HashMap<String, Child>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -516,48 +517,210 @@ pub async fn get_local_transcript_layers(state: tauri::State<'_, AppState>, meet
 #[tauri::command]
 pub async fn import_local_transcription(state: tauri::State<'_,AppState>, job_id: String, meeting_id: String, primary: Option<bool>) -> Result<Value,String> {
     let status = get_local_transcription_status(job_id.clone())?;
+    let imported=import_status(state.db_manager.pool(),&job_id,&meeting_id,primary.unwrap_or(false),&status).await?;
+    if imported["stale_snapshot"]!=true {
+        crate::local_workspace::set_job_metadata(imported["meeting_id"].as_str().unwrap(),
+            imported["source_meeting_id"].as_str().unwrap(),&job_id,&status)?;
+    }
+    Ok(imported)
+}
+
+#[derive(Clone, Debug)]
+struct CanonicalWindow { id:String, text:String, track:String, start:f64, end:f64, snapshot:Value }
+
+fn owned_window(job:&str, value:&Value) -> Result<CanonicalWindow,String> {
+    let id=value["id"].as_str().ok_or("Missing segment ID")?;
+    valid_id(id)?;
+    let suffix=id.strip_prefix(&format!("{job}-")).ok_or("Segment belongs to a different job")?;
+    let track=value["source_track"].as_str().ok_or("Missing source track")?;
+    if !["microphone","system"].contains(&track) || !suffix.starts_with(&format!("{track}-")) {
+        return Err("Segment ID and source track do not match".into());
+    }
+    let text=value["text"].as_str().ok_or("Invalid raw transcript")?;
+    let start=value["start_seconds"].as_f64().ok_or("Missing window time")?;
+    let end=value["end_seconds"].as_f64().ok_or("Missing window time")?;
+    if !start.is_finite() || !end.is_finite() || start<0. || end<=start { return Err("Invalid window times".into()); }
+    Ok(CanonicalWindow{id:id.into(),text:text.into(),track:track.into(),start,end,snapshot:value.clone()})
+}
+
+fn canonical_windows(job:&str,status:&Value) -> Result<(Vec<CanonicalWindow>,Vec<CanonicalWindow>,Option<i64>,String),String> {
+    valid_id(job)?;
+    if status.get("job_id").is_some() && status["job_id"].as_str()!=Some(job) { return Err("Worker job identity changed".into()); }
+    let revision=match status.get("segments_revision") {
+        None=>None,
+        Some(value)=>Some(value.as_u64().filter(|v|*v<=i64::MAX as u64).ok_or("Invalid segments revision")? as i64),
+    };
+    let active=status["segments"].as_array().ok_or("Worker segments missing")?.iter()
+        .map(|value|owned_window(job,value)).collect::<Result<Vec<_>,_>>()?;
+    let archive=match status.get("superseded_segments") {
+        None=>Vec::new(),
+        Some(value)=>value.as_array().ok_or("Invalid superseded segments")?.iter()
+            .map(|value|owned_window(job,value)).collect::<Result<Vec<_>,_>>()?,
+    };
+    let mut ids=HashSet::new();
+    for window in &active { if !ids.insert(window.id.clone()) { return Err("Duplicate active segment ID".into()); } }
+    let mut ordered:Vec<_>=active.iter().collect();
+    ordered.sort_by(|a,b|a.track.cmp(&b.track).then(a.start.total_cmp(&b.start)));
+    for pair in ordered.windows(2) {
+        if pair[0].track==pair[1].track && pair[1].start<pair[0].end-1e-9 {
+            return Err("Active transcript windows overlap on the same track".into());
+        }
+    }
+    let archived:HashMap<_,_>=archive.iter().map(|w|(w.id.as_str(),w.track.as_str())).collect();
+    let all:HashMap<_,_>=active.iter().chain(archive.iter()).map(|w|(w.id.as_str(),w.track.as_str())).collect();
+    for window in &active {
+        if let Some(replaces)=window.snapshot.get("replaces_segment_ids") {
+            let mut seen=HashSet::new();
+            for id in replaces.as_array().ok_or("Invalid replaced segment IDs")? {
+                let id=id.as_str().ok_or("Invalid replaced segment ID")?;
+                if !seen.insert(id) || archived.get(id)!=Some(&window.track.as_str()) {
+                    return Err("Replacement is missing its same-track archived source".into());
+                }
+            }
+        }
+    }
+    for window in &archive {
+        let by=window.snapshot["superseded_by"].as_array().filter(|by|!by.is_empty()).ok_or("Archive is missing its replacement edge")?;
+        for id in by {
+            if all.get(id.as_str().ok_or("Invalid replacement edge")?)!=Some(&window.track.as_str()) {
+                return Err("Archived replacement belongs to another track or is missing".into());
+            }
+        }
+        let at=window.snapshot["superseded_at_segments_revision"].as_u64().ok_or("Archive revision is missing")?;
+        if revision.map(|r|at>r as u64).unwrap_or(true) { return Err("Archive revision exceeds active selection".into()); }
+    }
+    let mut fingerprint:Vec<_>=active.iter().map(|w|json!([w.id,w.text,w.track,w.start,w.end])).collect();
+    fingerprint.sort_by(|a,b|a[0].as_str().cmp(&b[0].as_str()));
+    let fingerprint=format!("{:x}",Sha256::digest(serde_json::to_vec(&fingerprint).map_err(|e|e.to_string())?));
+    Ok((active,archive,revision,fingerprint))
+}
+
+async fn preserve_raw(tx:&mut sqlx::Transaction<'_,sqlx::Sqlite>,job:&str,meeting:&str,snapshot:&Value) -> Result<(),String> {
+    let bytes=serde_json::to_vec(snapshot).map_err(|e|e.to_string())?;
+    let hash=format!("{:x}",Sha256::digest(&bytes));
+    sqlx::query("INSERT OR IGNORE INTO local_transcription_raw_history(job_id,meeting_id,segment_id,raw_text,audio_start_time,audio_end_time,snapshot_sha256,segment_snapshot,archived_at) VALUES(?,?,?,?,?,?,?,?,?)")
+        .bind(job).bind(meeting).bind(snapshot["id"].as_str().ok_or("History segment ID missing")?)
+        .bind(snapshot["text"].as_str().ok_or("History raw text missing")?)
+        .bind(snapshot["start_seconds"].as_f64()).bind(snapshot["end_seconds"].as_f64())
+        .bind(hash).bind(String::from_utf8(bytes).map_err(|e|e.to_string())?).bind(chrono::Utc::now().to_rfc3339())
+        .execute(&mut **tx).await.map_err(|e|e.to_string())?;
+    Ok(())
+}
+
+/// Pool-only import keeps replacement validation/history/upserts in one SQLite
+/// transaction. Callers publish workspace metadata only after a nonstale import.
+async fn import_status(pool:&sqlx::SqlitePool,job_id:&str,meeting_id:&str,primary:bool,status:&Value) -> Result<Value,String> {
+    valid_id(meeting_id)?;
+    let (active,archive,revision,fingerprint)=canonical_windows(job_id,status)?;
     let title: String = sqlx::query_scalar("SELECT title FROM meetings WHERE id = ?").bind(&meeting_id)
-        .fetch_one(state.db_manager.pool()).await.map_err(|e| e.to_string())?;
+        .fetch_one(pool).await.map_err(|e| e.to_string())?;
     let folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?").bind(&meeting_id)
-        .fetch_one(state.db_manager.pool()).await.map_err(|e|e.to_string())?;
+        .fetch_one(pool).await.map_err(|e|e.to_string())?;
     if !folder.as_deref().zip(status["session_dir"].as_str()).map(|(a,b)|path_key(a)==path_key(b)).unwrap_or(false) {
         return Err("The transcription job belongs to a different recording".into());
     }
     let profile = status["profile"].as_str().ok_or("Job profile missing")?;
-    let mut tx = state.db_manager.pool().begin().await.map_err(|e| e.to_string())?;
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     sqlx::query("CREATE TABLE IF NOT EXISTS local_transcription_bindings (job_id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL UNIQUE REFERENCES meetings(id) ON DELETE CASCADE, source_meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE)")
         .execute(&mut *tx).await.map_err(|e|e.to_string())?;
     let binding: Option<(String,String)> = sqlx::query_as("SELECT meeting_id,source_meeting_id FROM local_transcription_bindings WHERE job_id=?")
         .bind(&job_id).fetch_optional(&mut *tx).await.map_err(|e|e.to_string())?;
-    let source_meeting_id=binding.as_ref().map(|(_,source)|source.clone()).unwrap_or_else(||meeting_id.clone());
-    let child_id = if let Some((bound,_))=binding { bound } else if primary.unwrap_or(false) {
+    let previously_bound=binding.is_some();
+    let source_meeting_id=binding.as_ref().map(|(_,source)|source.clone()).unwrap_or_else(||meeting_id.to_owned());
+    let child_id = if let Some((bound,_))=binding { bound } else if primary {
         let occupied: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM transcripts WHERE meeting_id=?) + (SELECT count(*) FROM local_transcription_bindings WHERE meeting_id=?)")
             .bind(&meeting_id).bind(&meeting_id).fetch_one(&mut *tx).await.map_err(|e|e.to_string())?;
         if occupied>0 { return Err("This meeting already has a transcript. Import the new version as a separate comparison.".into()); }
-        meeting_id.clone()
+        meeting_id.to_owned()
     } else { format!("meeting-local-{job_id}") };
+    if !previously_bound && !primary {
+        let occupied:i64=sqlx::query_scalar("SELECT count(*) FROM meetings WHERE id=?")
+            .bind(&child_id).fetch_one(&mut *tx).await.map_err(|e|e.to_string())?;
+        if occupied>0 { return Err("The transcript target collides with an unbound meeting".into()); }
+    }
+    sqlx::query("CREATE TABLE IF NOT EXISTS local_transcription_imports(job_id TEXT PRIMARY KEY,meeting_id TEXT NOT NULL,segments_revision INTEGER,selection_sha256 TEXT NOT NULL,worker_updated_at TEXT)")
+        .execute(&mut *tx).await.map_err(|e|e.to_string())?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS local_transcription_raw_history(job_id TEXT NOT NULL,meeting_id TEXT NOT NULL,segment_id TEXT NOT NULL,raw_text TEXT NOT NULL,audio_start_time REAL,audio_end_time REAL,snapshot_sha256 TEXT NOT NULL,segment_snapshot TEXT NOT NULL,archived_at TEXT NOT NULL,PRIMARY KEY(job_id,meeting_id,segment_id,snapshot_sha256))")
+        .execute(&mut *tx).await.map_err(|e|e.to_string())?;
+    let previous:Option<(String,Option<i64>,String,Option<String>)>=sqlx::query_as("SELECT meeting_id,segments_revision,selection_sha256,worker_updated_at FROM local_transcription_imports WHERE job_id=?")
+        .bind(job_id).fetch_optional(&mut *tx).await.map_err(|e|e.to_string())?;
+    let updated=status["updated_at"].as_str();
+    if let Some((bound,prior,prior_hash,prior_updated))=&previous {
+        if bound!=&child_id { return Err("Import checkpoint belongs to another meeting".into()); }
+        let stale=match (prior,revision) { (Some(_),None)=>true,(Some(a),Some(b))=>b<*a,_=>false }
+            || (prior==&revision && prior_updated.as_deref().zip(updated).and_then(|(a,b)|Some((chrono::DateTime::parse_from_rfc3339(a).ok()?,chrono::DateTime::parse_from_rfc3339(b).ok()?)))
+                .map(|(a,b)|b<a).unwrap_or(false));
+        if stale { return Ok(json!({"meeting_id":child_id,"source_meeting_id":source_meeting_id,"imported_count":0,"stale_snapshot":true})); }
+        if revision.is_some() && prior==&revision && prior_hash!=&fingerprint {
+            return Err("Canonical transcript changed without a newer segments revision".into());
+        }
+    }
+    // IDs are globally unique in transcripts; never ignore a collision in
+    // another meeting even when the incoming segment happens to share its text.
+    for window in active.iter().chain(archive.iter()) {
+        let owner:Option<String>=sqlx::query_scalar("SELECT meeting_id FROM transcripts WHERE id=?")
+            .bind(&window.id).fetch_optional(&mut *tx).await.map_err(|e|e.to_string())?;
+        if owner.as_deref().map(|owner|owner!=child_id).unwrap_or(false) { return Err("Segment ID collides with another meeting".into()); }
+    }
+    let active_ids:HashSet<_>=active.iter().map(|w|w.id.as_str()).collect();
+    let archive_ids:HashSet<_>=archive.iter().map(|w|w.id.as_str()).collect();
+    let existing:Vec<(String,String,String,Option<f64>,Option<f64>,Option<f64>)>=sqlx::query_as("SELECT id,transcript,timestamp,audio_start_time,audio_end_time,duration FROM transcripts WHERE meeting_id=? AND instr(id,?)=1")
+        .bind(&child_id).bind(format!("{job_id}-")).fetch_all(&mut *tx).await.map_err(|e|e.to_string())?;
+    for (id,text,timestamp,start,end,duration) in &existing {
+        if !active_ids.contains(id.as_str()) && !archive_ids.contains(id.as_str()) {
+            if revision.is_none() { return Ok(json!({"meeting_id":child_id,"source_meeting_id":source_meeting_id,"imported_count":0,"stale_snapshot":true})); }
+            return Err("Removed transcript segment is missing its archived snapshot".into());
+        }
+        let changed=active.iter().find(|w|&w.id==id).map(|w|&w.text!=text || Some(w.start)!=*start || Some(w.end)!=*end).unwrap_or(true);
+        if changed {
+            preserve_raw(&mut tx,job_id,&child_id,&json!({"id":id,"text":text,"timestamp":timestamp,
+                "start_seconds":start,"end_seconds":end,"duration":duration,
+                "source_track":id.strip_prefix(&format!("{job_id}-")).and_then(|suffix|suffix.split('-').next()),
+                "history_origin":"database_before_replacement"})).await?;
+        }
+    }
     let now = chrono::Utc::now();
     sqlx::query("INSERT OR IGNORE INTO meetings(id,title,created_at,updated_at,folder_path) VALUES(?,?,?,?,?)")
         .bind(&child_id).bind(format!("{title} — {}", match status["workflow_role"].as_str() { Some("live-draft") => "Apex live draft", Some("fallback") => "Apex fallback", _ => profile })).bind(now).bind(now).bind(status["session_dir"].as_str())
         .execute(&mut *tx).await.map_err(|e| e.to_string())?;
-    sqlx::query("INSERT OR IGNORE INTO local_transcription_bindings(job_id,meeting_id,source_meeting_id) VALUES(?,?,?)")
+    sqlx::query("INSERT INTO local_transcription_bindings(job_id,meeting_id,source_meeting_id) VALUES(?,?,?) ON CONFLICT(job_id) DO NOTHING")
         .bind(&job_id).bind(&child_id).bind(&source_meeting_id).execute(&mut *tx).await.map_err(|e|e.to_string())?;
+    for window in &archive { preserve_raw(&mut tx,job_id,&child_id,&window.snapshot).await?; }
+    let mut removed=0;
+    for id in &archive_ids {
+        if !active_ids.contains(id) {
+            removed+=sqlx::query("DELETE FROM transcripts WHERE meeting_id=? AND id=?")
+                .bind(&child_id).bind(id).execute(&mut *tx).await.map_err(|e|e.to_string())?.rows_affected();
+        }
+    }
     let mut imported = 0;
-    for segment in status["segments"].as_array().ok_or("Worker segments missing")? {
-        let text = segment["text"].as_str().ok_or("Invalid raw transcript")?;
-        if text.is_empty() { continue; }
-        let start = segment["start_seconds"].as_f64().ok_or("Missing window time")?;
-        let end = segment["end_seconds"].as_f64().ok_or("Missing window time")?;
-        if !start.is_finite() || !end.is_finite() || end<=start { return Err("Invalid window times".into()); }
-        let done = sqlx::query("INSERT OR IGNORE INTO transcripts(id,meeting_id,transcript,timestamp,audio_start_time,audio_end_time,duration) VALUES(?,?,?,?,?,?,?)")
-            .bind(segment["id"].as_str().ok_or("Missing segment ID")?).bind(&child_id).bind(text)
-            .bind(format!("{:02}:{:02}",start as u64/60,start as u64%60)).bind(start).bind(end).bind(end-start)
+    for window in &active {
+        // New classifier-skip windows remain absent as before; an existing row
+        // selected as empty still updates so stale text cannot survive.
+        if window.text.is_empty() && !existing.iter().any(|row|row.0==window.id) { continue; }
+        let done = sqlx::query("INSERT INTO transcripts(id,meeting_id,transcript,timestamp,audio_start_time,audio_end_time,duration) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET transcript=excluded.transcript,timestamp=excluded.timestamp,audio_start_time=excluded.audio_start_time,audio_end_time=excluded.audio_end_time,duration=excluded.duration WHERE transcripts.meeting_id=excluded.meeting_id AND (transcripts.transcript IS NOT excluded.transcript OR transcripts.audio_start_time IS NOT excluded.audio_start_time OR transcripts.audio_end_time IS NOT excluded.audio_end_time)")
+            .bind(&window.id).bind(&child_id).bind(&window.text)
+            .bind(format!("{:02}:{:02}",window.start as u64/60,window.start as u64%60)).bind(window.start).bind(window.end).bind(window.end-window.start)
             .execute(&mut *tx).await.map_err(|e| e.to_string())?;
         imported += done.rows_affected();
     }
+    sqlx::query("INSERT INTO local_transcription_imports(job_id,meeting_id,segments_revision,selection_sha256,worker_updated_at) VALUES(?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET segments_revision=excluded.segments_revision,selection_sha256=excluded.selection_sha256,worker_updated_at=excluded.worker_updated_at WHERE local_transcription_imports.meeting_id=excluded.meeting_id")
+        .bind(job_id).bind(&child_id).bind(revision).bind(fingerprint).bind(updated)
+        .execute(&mut *tx).await.map_err(|e|e.to_string())?;
     tx.commit().await.map_err(|e| e.to_string())?;
-    crate::local_workspace::set_job_metadata(&child_id,&source_meeting_id,&job_id,&status)?;
-    Ok(json!({"meeting_id":child_id,"imported_count":imported}))
+    Ok(json!({"meeting_id":child_id,"source_meeting_id":source_meeting_id,"imported_count":imported,"removed_count":removed,"stale_snapshot":false,"segments_revision":revision}))
+}
+
+pub(crate) async fn correction_source_matches(pool:&sqlx::SqlitePool,meeting:&str,id:&str,original:&str) -> Result<bool,String> {
+    let current:Option<String>=sqlx::query_scalar("SELECT transcript FROM transcripts WHERE meeting_id=? AND id=?")
+        .bind(meeting).bind(id).fetch_optional(pool).await.map_err(|e|e.to_string())?;
+    if current.as_deref()==Some(original) { return Ok(true); }
+    let history_exists:i64=sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='local_transcription_raw_history'")
+        .fetch_one(pool).await.map_err(|e|e.to_string())?;
+    if history_exists==0 { return Ok(false); }
+    let found:i64=sqlx::query_scalar("SELECT count(*) FROM local_transcription_raw_history WHERE meeting_id=? AND segment_id=? AND raw_text=?")
+        .bind(meeting).bind(id).bind(original).fetch_one(pool).await.map_err(|e|e.to_string())?;
+    Ok(found>0)
 }
 
 fn claude_link(mode: &str, file: Option<&Path>) -> Result<String,String> {
@@ -596,6 +759,138 @@ pub fn open_claude_desktop(mode: String, transcript: String, title: String) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn import_pool() -> sqlx::SqlitePool {
+        let pool=sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE meetings(id TEXT PRIMARY KEY,title TEXT NOT NULL,created_at TEXT,updated_at TEXT,folder_path TEXT)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE transcripts(id TEXT PRIMARY KEY,meeting_id TEXT NOT NULL REFERENCES meetings(id),transcript TEXT NOT NULL,timestamp TEXT NOT NULL,audio_start_time REAL,audio_end_time REAL,duration REAL)").execute(&pool).await.unwrap();
+        for id in ["source","other"] {
+            sqlx::query("INSERT INTO meetings(id,title,folder_path) VALUES(?,?,?)").bind(id).bind(id).bind("/fixture-recording").execute(&pool).await.unwrap();
+        }
+        pool
+    }
+    fn window(job:&str,track:&str,suffix:&str,start:f64,end:f64,text:&str) -> Value {
+        json!({"id":format!("{job}-{track}-{suffix}"),"source_track":track,"start_seconds":start,"end_seconds":end,"text":text})
+    }
+    fn checkpoint(job:&str,revision:u64,segments:Vec<Value>,archive:Vec<Value>) -> Value {
+        json!({"job_id":job,"profile":"trelis-20","session_dir":"/fixture-recording",
+            "segments_revision":revision,"segments":segments,"superseded_segments":archive})
+    }
+    fn archived(mut value:Value,by:Vec<String>,revision:u64) -> Value {
+        value["superseded_by"]=json!(by);value["superseded_at_segments_revision"]=json!(revision);value
+    }
+    async fn raw_rows(pool:&sqlx::SqlitePool,meeting:&str) -> Vec<(String,String,f64,f64)> {
+        sqlx::query_as("SELECT id,transcript,audio_start_time,audio_end_time FROM transcripts WHERE meeting_id=? ORDER BY audio_start_time,id")
+            .bind(meeting).fetch_all(pool).await.unwrap()
+    }
+    #[tokio::test]
+    async fn same_count_selection_updates_raw_and_preserves_correction_source_and_revision() {
+        let pool=import_pool().await;
+        let original=window("job","microphone","0",0.,20.,"जो जो जो");
+        let first=checkpoint("job",1,vec![original.clone()],vec![]);
+        let result=import_status(&pool,"job","source",false,&first).await.unwrap();
+        let meeting=result["meeting_id"].as_str().unwrap();
+        let mut selected=original.clone();selected["text"]=json!("recovered speech");
+        selected["replaces_segment_ids"]=json!([original["id"]]);
+        let second=checkpoint("job",2,vec![selected.clone()],vec![archived(original.clone(),vec![original["id"].as_str().unwrap().into()],2)]);
+        assert_eq!(import_status(&pool,"job","source",false,&second).await.unwrap()["imported_count"],1);
+        assert_eq!(raw_rows(&pool,meeting).await[0].1,"recovered speech");
+        assert!(correction_source_matches(&pool,meeting,"job-microphone-0","जो जो जो").await.unwrap());
+        assert!(correction_source_matches(&pool,meeting,"job-microphone-0","recovered speech").await.unwrap());
+        assert!(!correction_source_matches(&pool,meeting,"job-microphone-0","invented original").await.unwrap());
+        assert!(!correction_source_matches(&pool,"other","job-microphone-0","जो जो जो").await.unwrap());
+        let history:i64=sqlx::query_scalar("SELECT count(*) FROM local_transcription_raw_history").fetch_one(&pool).await.unwrap();
+        assert!(history>=2); // complete worker snapshot plus database raw/time snapshot
+        assert_eq!(import_status(&pool,"job","source",false,&second).await.unwrap()["imported_count"],0);
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM local_transcription_raw_history").fetch_one(&pool).await.unwrap(),history);
+        assert_eq!(import_status(&pool,"job","source",false,&first).await.unwrap()["stale_snapshot"],true);
+        assert_eq!(raw_rows(&pool,meeting).await[0].1,"recovered speech");
+        let mut invalid=second;invalid["segments"][0]["text"]=json!("same revision changed text");
+        assert!(import_status(&pool,"job","source",false,&invalid).await.unwrap_err().contains("newer segments revision"));
+        assert_eq!(raw_rows(&pool,meeting).await[0].1,"recovered speech");
+    }
+    #[tokio::test]
+    async fn context_and_fringe_replace_two_ranges_once_and_preserve_parallel_track() {
+        let pool=import_pool().await;
+        let core=window("job","microphone","0",0.,20.,"loop");
+        let neighbor=window("job","microphone","320000",20.,40.,"neighbor");
+        let system=window("job","system","0",0.,20.,"system speech");
+        let first=checkpoint("job",1,vec![core.clone(),neighbor.clone(),system.clone()],vec![]);
+        import_status(&pool,"job","source",false,&first).await.unwrap();
+        let mut context=window("job","microphone","c-0-480000",0.,30.,"recovered context");
+        let mut fringe=window("job","microphone","f-480000-640000",30.,40.,"remaining neighbor");
+        context["replaces_segment_ids"]=json!([core["id"],neighbor["id"]]);
+        fringe["replaces_segment_ids"]=json!([neighbor["id"]]);
+        let archive=vec![archived(core.clone(),vec![context["id"].as_str().unwrap().into()],2),
+            archived(neighbor.clone(),vec![context["id"].as_str().unwrap().into(),fringe["id"].as_str().unwrap().into()],2)];
+        let second=checkpoint("job",2,vec![context.clone(),fringe.clone(),system.clone()],archive);
+        let result=import_status(&pool,"job","source",false,&second).await.unwrap();
+        assert_eq!(result["removed_count"],2);
+        let rows=raw_rows(&pool,"meeting-local-job").await;
+        assert_eq!(rows.len(),3);
+        assert!(rows.iter().any(|row|row.1=="recovered context" && row.2==0. && row.3==30.));
+        assert!(rows.iter().any(|row|row.1=="remaining neighbor" && row.2==30. && row.3==40.));
+        assert!(rows.iter().any(|row|row.0=="job-system-0" && row.1=="system speech"));
+        assert!(!rows.iter().any(|row|row.0=="job-microphone-0" || row.0=="job-microphone-320000"));
+        assert!(correction_source_matches(&pool,"meeting-local-job","job-microphone-320000","neighbor").await.unwrap());
+    }
+    #[tokio::test]
+    async fn collisions_and_unarchived_removal_preserve_other_meetings_and_prior_rows() {
+        let pool=import_pool().await;
+        let core=window("job","microphone","0",0.,20.,"original");
+        import_status(&pool,"job","source",false,&checkpoint("job",1,vec![core.clone()],vec![])).await.unwrap();
+        let foreign=checkpoint("job",2,vec![window("another","microphone","0",0.,20.,"wrong job")],vec![]);
+        assert!(import_status(&pool,"job","source",false,&foreign).await.unwrap_err().contains("different job"));
+        let replacement=checkpoint("job",2,vec![window("job","microphone","c-0-480000",0.,30.,"replacement")],vec![]);
+        assert!(import_status(&pool,"job","source",false,&replacement).await.unwrap_err().contains("archived snapshot"));
+        sqlx::query("INSERT INTO transcripts(id,meeting_id,transcript,timestamp,audio_start_time,audio_end_time) VALUES('next-microphone-0','other','other raw','00:00',0,20)").execute(&pool).await.unwrap();
+        let colliding=checkpoint("next",1,vec![window("next","microphone","0",0.,20.,"new raw")],vec![]);
+        assert!(import_status(&pool,"next","source",false,&colliding).await.unwrap_err().contains("another meeting"));
+        assert_eq!(raw_rows(&pool,"other").await[0].1,"other raw");
+        assert_eq!(raw_rows(&pool,"meeting-local-job").await[0].1,"original");
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM meetings WHERE id='meeting-local-next'").fetch_one(&pool).await.unwrap(),0);
+    }
+    #[test]
+    fn canonical_selection_rejects_duplicate_overlap_and_cross_track_edges() {
+        let mic=window("job","microphone","0",0.,20.,"mic");
+        let system=window("job","system","0",0.,20.,"system");
+        assert!(canonical_windows("job",&checkpoint("job",1,vec![mic.clone(),system.clone()],vec![])).is_ok());
+        assert!(canonical_windows("job",&checkpoint("job",1,vec![mic.clone(),mic.clone()],vec![])).unwrap_err().contains("Duplicate"));
+        assert!(canonical_windows("job",&checkpoint("job",1,vec![mic.clone(),window("job","microphone","160000",10.,30.,"overlap")],vec![])).unwrap_err().contains("overlap"));
+        let mut selected=mic.clone();selected["replaces_segment_ids"]=json!([system["id"]]);
+        let invalid=checkpoint("job",2,vec![selected],vec![archived(system,vec![mic["id"].as_str().unwrap().into()],2)]);
+        assert!(canonical_windows("job",&invalid).unwrap_err().contains("same-track"));
+        let mut missing=mic.clone();missing["replaces_segment_ids"]=json!(["job-microphone-missing"]);
+        assert!(canonical_windows("job",&checkpoint("job",2,vec![missing],vec![])).is_err());
+    }
+    #[tokio::test]
+    async fn sql_error_rolls_back_raw_history_deletes_upserts_and_checkpoint() {
+        let pool=import_pool().await;
+        let original=window("job","microphone","0",0.,20.,"original");
+        import_status(&pool,"job","source",false,&checkpoint("job",1,vec![original.clone()],vec![])).await.unwrap();
+        sqlx::query("CREATE TRIGGER fixture_abort BEFORE INSERT ON transcripts WHEN NEW.transcript='force-error' BEGIN SELECT RAISE(ABORT,'fixture failure'); END").execute(&pool).await.unwrap();
+        let mut changed=window("job","microphone","c-0-480000",0.,30.,"force-error");
+        changed["replaces_segment_ids"]=json!([original["id"]]);
+        let next=checkpoint("job",2,vec![changed.clone()],vec![archived(original,vec![changed["id"].as_str().unwrap().into()],2)]);
+        assert!(import_status(&pool,"job","source",false,&next).await.is_err());
+        assert_eq!(raw_rows(&pool,"meeting-local-job").await[0].1,"original");
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM local_transcription_raw_history").fetch_one(&pool).await.unwrap(),0);
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT segments_revision FROM local_transcription_imports WHERE job_id='job'").fetch_one(&pool).await.unwrap(),1);
+    }
+    #[tokio::test]
+    async fn legacy_append_only_status_imports_and_older_polls_do_not_rollback() {
+        let pool=import_pool().await;
+        let mut first=checkpoint("job",0,vec![window("job","microphone","0",0.,20.,"first")],vec![]);
+        first.as_object_mut().unwrap().remove("segments_revision");
+        first.as_object_mut().unwrap().remove("superseded_segments");
+        import_status(&pool,"job","source",false,&first).await.unwrap();
+        let mut second=first.clone();second["segments"].as_array_mut().unwrap().push(window("job","microphone","320000",20.,40.,"second"));
+        import_status(&pool,"job","source",false,&second).await.unwrap();
+        assert_eq!(raw_rows(&pool,"meeting-local-job").await.len(),2);
+        assert_eq!(import_status(&pool,"job","source",false,&first).await.unwrap()["stale_snapshot"],true);
+        assert_eq!(raw_rows(&pool,"meeting-local-job").await.len(),2);
+    }
+
     fn synthetic_asr_runtime(root: &Path, label: &str) -> Value {
         let mut config = json!({"models":{"trelis":{"backend":label}}});
         for key in ["python_executable", "worker_script", "registry_path"] {

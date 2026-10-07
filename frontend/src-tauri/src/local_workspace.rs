@@ -107,7 +107,7 @@ fn with_job_metadata(dir: &Path, mut value: serde_json::Value) -> Result<serde_j
     // Worker progress has its own immutable revision stream. It must not make
     // a user's unsaved notes/corrections stale every twenty seconds.
     if let Some(metadata)=latest_revision(&dir.join("job-metadata"))? {
-        for key in ["source_job_id","source_meeting_id","profile","workflow_role","segment_metadata"] {
+        for key in ["source_job_id","source_meeting_id","profile","workflow_role","segment_metadata","superseded_segments","segments_revision"] {
             value[key]=metadata[key].clone();
         }
     }
@@ -151,9 +151,11 @@ pub async fn save_transcript_workspace(
     let mut ids = HashSet::new();
     for c in &corrections {
         if !ids.insert(&c.segment_id) || c.text.len() > 100_000 { return Err("Duplicate or oversized correction".into()); }
-        let source: Option<String> = sqlx::query_scalar("SELECT transcript FROM transcripts WHERE meeting_id = ? AND id = ?")
-            .bind(&meeting_id).bind(&c.segment_id).fetch_optional(state.db_manager.pool()).await.map_err(|e| e.to_string())?;
-        if source.as_deref() != Some(c.original_text.as_str()) { return Err("A correction no longer matches its original transcript. Reload before saving.".into()); }
+        // An archived correction remains a saved reference. The frontend only
+        // applies it when its original_text exactly matches current raw text.
+        if !crate::local_transcription::correction_source_matches(state.db_manager.pool(),&meeting_id,&c.segment_id,&c.original_text).await? {
+            return Err("A correction no longer matches a verified transcript source. Reload before saving.".into());
+        }
     }
     let _guard = STORE_LOCK.lock().map_err(|e| e.to_string())?;
     let dir = object_dir(&data_root()?, "workspaces", &meeting_id)?;
@@ -238,24 +240,41 @@ pub fn set_job_metadata(id: &str, parent: &str, job: &str, status: &serde_json::
 fn set_job_metadata_at(root: &Path, id: &str, parent: &str, job: &str, status: &serde_json::Value) -> Result<(),String> {
     let dir=object_dir(root,"workspaces",id)?.join("job-metadata");
     let mut value=latest_revision(&dir)?.unwrap_or_else(||serde_json::json!({"version":1,"revision":0}));
+    if let Some(previous_job)=value["source_job_id"].as_str() {
+        if previous_job!=job { return Err("Workspace metadata belongs to another job".into()); }
+        let old=value["segments_revision"].as_u64();
+        let new=status["segments_revision"].as_u64();
+        if old.is_some() && (new.is_none() || new<old) { return Ok(()); }
+        if old==new && value["worker_updated_at"].as_str().zip(status["updated_at"].as_str())
+            .and_then(|(a,b)|Some((chrono::DateTime::parse_from_rfc3339(a).ok()?,chrono::DateTime::parse_from_rfc3339(b).ok()?)))
+            .map(|(a,b)|b<a).unwrap_or(false) { return Ok(()); }
+    }
     let mut metadata=serde_json::Map::new();
     for segment in status["segments"].as_array().ok_or("Missing segments")? {
         if let Some(sid)=segment["id"].as_str() {
             let mut item=serde_json::json!({"source_track":segment["source_track"],"timestamp_kind":"audio_window",
-                "quality_flags":segment["quality_flags"],"alternative":segment["alternative"]});
-            if segment["alternative"]["promoted"] == true {
-                if let Some(original)=segment["recognition_original"]["text"].as_str() {
+                "quality_flags":segment["quality_flags"],"alternative":segment["alternative"],
+                "recovery":segment["recovery"],"replaces_segment_ids":segment["replaces_segment_ids"]});
+            if let Some(original)=segment["recognition_original"]["text"].as_str() {
+                if segment["alternative"]["promoted"]==true || segment["text"].as_str().map(|text|text!=original).unwrap_or(false) {
                     item["original_recognition_text"]=original.into();
                 }
             }
             metadata.insert(sid.into(),item);
         }
     }
-    if value["source_job_id"]==job && value["segment_metadata"]==serde_json::Value::Object(metadata.clone()) { return Ok(()); }
+    let archive=status.get("superseded_segments").cloned().unwrap_or_else(||serde_json::json!([]));
+    if !archive.is_array() { return Err("Invalid superseded transcript metadata".into()); }
+    if value["source_job_id"]==job && value["segment_metadata"]==serde_json::Value::Object(metadata.clone())
+        && value["superseded_segments"]==archive && value["segments_revision"]==status["segments_revision"]
+        && value["worker_updated_at"]==status["updated_at"] { return Ok(()); }
     let expected=value["revision"].as_u64().unwrap_or(0);
     value["source_job_id"]=job.into(); value["source_meeting_id"]=parent.into(); value["profile"]=status["profile"].clone();
     value["workflow_role"]=status["workflow_role"].clone();
     value["segment_metadata"]=metadata.into();
+    value["superseded_segments"]=archive;
+    value["segments_revision"]=status["segments_revision"].clone();
+    value["worker_updated_at"]=status["updated_at"].clone();
     append_revision(&dir,expected,value)?;
     Ok(())
 }
@@ -480,6 +499,37 @@ mod tests {
         let old=latest_revision(&root.path().join("workspaces/meeting-two/job-metadata")).unwrap().unwrap();
         assert_eq!(old["segment_metadata"]["old-chunk"]["alternative"],legacy["segments"][0]["alternative"]);
         assert!(old["segment_metadata"]["old-chunk"].get("original_recognition_text").is_none());
+    }
+    #[test]
+    fn canonical_recovery_metadata_keeps_archives_and_rejects_stale_revision_without_changing_notes() {
+        let root=tempfile::tempdir().unwrap();
+        let dir=root.path().join("workspaces/meeting-one");
+        let saved=append_revision(&dir,0,serde_json::json!({"notes":"retained notes","corrections":[{
+            "segment_id":"job-microphone-0","original_text":"old loop","text":"manual correction","updated_at":"earlier"
+        }]})).unwrap();
+        let archive=serde_json::json!([{"id":"job-microphone-0","text":"old loop","source_track":"microphone",
+            "start_seconds":0,"end_seconds":20,"superseded_by":["job-microphone-c-0-480000"],"superseded_at_segments_revision":2}]);
+        let status=serde_json::json!({"profile":"trelis-20","segments_revision":2,"updated_at":"2026-10-07T12:00:00Z",
+            "superseded_segments":archive,"segments":[{"id":"job-microphone-c-0-480000","text":"selected context",
+                "source_track":"microphone","replaces_segment_ids":["job-microphone-0"],
+                "recognition_original":{"text":"old loop"},"recovery":{"state":"complete","method":"context_window_retry"}}]});
+        set_job_metadata_at(root.path(),"meeting-one","source","job",&status).unwrap();
+        let loaded=with_job_metadata(&dir,saved.clone()).unwrap();
+        assert_eq!(loaded["segments_revision"],2);
+        assert_eq!(loaded["superseded_segments"],archive);
+        assert_eq!(loaded["segment_metadata"]["job-microphone-c-0-480000"]["original_recognition_text"],"old loop");
+        assert_eq!(loaded["segment_metadata"]["job-microphone-c-0-480000"]["recovery"]["method"],"context_window_retry");
+        assert_eq!(loaded["corrections"],saved["corrections"]);
+        assert_eq!(loaded["notes"],"retained notes");
+        assert_eq!(loaded["revision"],1);
+        let mut stale=status.clone();stale["segments_revision"]=serde_json::json!(1);stale["superseded_segments"]=serde_json::json!([]);
+        set_job_metadata_at(root.path(),"meeting-one","source","job",&stale).unwrap();
+        assert_eq!(with_job_metadata(&dir,saved.clone()).unwrap()["superseded_segments"],archive);
+        let mut old_progress=status.clone();old_progress["updated_at"]=serde_json::json!("2026-10-07T11:00:00Z");
+        old_progress["segments"][0]["recovery"]["state"]=serde_json::json!("waiting_for_context");
+        set_job_metadata_at(root.path(),"meeting-one","source","job",&old_progress).unwrap();
+        assert_eq!(with_job_metadata(&dir,saved).unwrap()["segment_metadata"]["job-microphone-c-0-480000"]["recovery"]["state"],"complete");
+        assert!(set_job_metadata_at(root.path(),"meeting-one","source","another-job",&status).is_err());
     }
     #[test]
     fn verified_quantity_requires_evidence_context_and_unit() {

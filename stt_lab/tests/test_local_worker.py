@@ -1,4 +1,6 @@
 """Synthetic recording tests; no microphone, downloaded model or network calls."""
+import copy
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import socket
@@ -11,9 +13,12 @@ import numpy as np
 from scipy.signal import resample_poly
 from sttbench import local_worker as worker
 from sttbench.manifest import file_digest, read_json, write_json
+from sttbench.runtime.api import _read_pcm
 
 
 class LocalWorkerTests(unittest.TestCase):
+    recovery_text = 'The speaker describes several distinct points and completes the previously interrupted thought clearly'
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='stt-worker-synthetic-')
         self.addCleanup(self.temp.cleanup)
@@ -22,15 +27,15 @@ class LocalWorkerTests(unittest.TestCase):
         self.session.mkdir()
         write_json(self.session/'session.json', {'id':'synthetic'})
 
-    def chunk(self, sequence, samples, rate=16000, start=None):
+    def chunk(self, sequence, samples, rate=16000, start=None, track='microphone'):
         start = float(sequence) if start is None else start
-        relative = f'tracks/microphone/{sequence:08}.wav'
+        relative = f'tracks/{track}/{sequence:08}.wav'
         path = self.session/relative
         path.parent.mkdir(parents=True, exist_ok=True)
         with wave.open(str(path), 'wb') as out:
             out.setnchannels(1); out.setsampwidth(2); out.setframerate(rate)
             out.writeframes(np.asarray(samples, dtype='<i2').tobytes())
-        return {'kind':'audio_chunk','track':'microphone','file':relative,'sequence':sequence,
+        return {'kind':'audio_chunk','track':track,'file':relative,'sequence':sequence,
                 'sample_rate':rate,'sample_count':len(samples),'start_seconds':start,
                 'end_seconds':start+len(samples)/rate,'sha256':file_digest(path)}
 
@@ -127,6 +132,434 @@ class LocalWorkerTests(unittest.TestCase):
                 'model_sha256': 'a' * 64, 'elapsed_seconds': .01,
                 'raw_max_probability': .6, 'boosted_max_probability': .8}
 
+    def recovery_fixture(self, row, start, end, previous=(), text=None, diagnostics=None):
+        job = self.root/'context-job'
+        job.mkdir(exist_ok=True)
+        job_id = '12345678-1234-1234-1234-123456789abc'
+        text = 'वो जब था ' * 5 if text is None else text
+        def segment(begin, finish, value, track='microphone', source_row=row, segment_id=None):
+            audio = worker.materialize(self.session, [source_row], begin, finish,
+                                       job/'windows'/f'{track}-{round(begin*16000)}.wav')
+            result = {'status': 'ok', 'text': value, 'decoding_diagnostics': diagnostics or {}}
+            evaluated = {'text': value, 'result': result, 'original_result': copy.deepcopy(result),
+                         'audio': audio, 'quality_flags': worker.recognition_flags(result, audio, finish-begin),
+                         'alternative': None}
+            return worker._segment_record(segment_id or f'{job_id}-{track}-{round(begin*16000)}',
+                                          track, 'trelis-20', 'trelis', begin, finish, evaluated)
+        core = segment(start, end, text)
+        left, right, desired, _ = worker.context_window_bounds(start, end, row['end_seconds'], True)
+        core['quality_flags'].extend(['context_retry_pending', 'needs_review'])
+        core['recovery'] = {'state': 'waiting_for_context', 'method': 'pending',
+                            'core_segment_id': core['id'], 'core_start_seconds': start, 'core_end_seconds': end,
+                            'context_start_seconds': left, 'context_end_seconds': right,
+                            'desired_context_end_seconds': desired, 'requires_review': True, 'attempts': []}
+        segments = [segment(*args) for args in previous] + [core]
+        status = {'version': 1, 'job_id': job_id, 'segments': segments, 'segments_revision': len(segments),
+                  'superseded_segments': [], 'cursors': {'microphone': end}, 'state': 'running'}
+        return status, job, segment
+
+    def test_context_bounds_match_profiles_and_clamp_capture_edges(self):
+        for seconds, expected in ((20, (35,65)), (10, (30,60)), (5, (27.5,57.5))):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(worker.context_window_bounds(40,40+seconds,100,False),
+                                 (*expected, expected[1], True))
+                self.assertFalse(worker.context_window_bounds(40,40+seconds,40+seconds,False)[3])
+        self.assertEqual(worker.context_window_bounds(0,20,20,False), (0,25,25,False))
+        self.assertEqual(worker.context_window_bounds(0,20,20,True), (0,20,25,True))
+        self.assertEqual(worker.context_window_bounds(20,23,23,True), (6.5,23,36.5,True))
+
+    def test_live_near_full_core_context_never_exceeds_runtime_thirty_second_cap(self):
+        # All are accepted by the run loop's seconds-.001 live tolerance.
+        for start,end in ((20,39.9990625),(60,79.9998125),(0,19.9990625)):
+            with self.subTest(start=start,end=end):
+                self.assertGreaterEqual(end-start,20-.001)
+                row=self.chunk(0,np.ones(50*16000)*1000,start=max(0,start-20))
+                left,right,desired,ready=worker.context_window_bounds(start,end,row['end_seconds'],False)
+                self.assertTrue(ready)
+                self.assertEqual(right,desired)
+                frames=round((right-left)*16000)
+                self.assertLessEqual(frames,30*16000)
+                if start:self.assertEqual(frames,30*16000)
+                path=self.root/'odd-padding.wav'
+                worker.materialize(self.session,[row],left,right,path)
+                _,duration=_read_pcm(path)  # Actual runtime validation; no inference.
+                self.assertLessEqual(duration,30)
+                pending=worker.context_window_bounds(start,end,end,False)
+                self.assertFalse(pending[3])
+                self.assertEqual(pending[:3],(left,right,desired))
+                final_left,final_right,final_desired,final_ready=worker.context_window_bounds(start,end,end,True)
+                self.assertTrue(final_ready)
+                self.assertEqual(final_right,end)
+                self.assertEqual((final_left,final_desired),(left,desired))
+                self.assertLessEqual(round((final_right-final_left)*16000),30*16000)
+
+    def test_final_context_preserves_unaligned_committed_edge_without_added_audio(self):
+        end=20+959999/48000
+        left,right,desired,ready=worker.context_window_bounds(20,end,end,True)
+        self.assertTrue(ready)
+        self.assertEqual(right,end)
+        self.assertLessEqual(round((desired-left)*16000),30*16000)
+        self.assertLessEqual(right,end)
+
+    def test_token_cap_defers_context_without_deleting_low_confidence_text(self):
+        row = self.chunk(0, np.ones(20*16000)*1000)
+        result = {'status':'ok', 'text':'short but unfinished words', 'decoding_diagnostics':{
+            'token_cap_reached': True, 'avg_logprob': None, 'no_speech_probability': None}}
+        evaluated = worker.evaluate_window({'id':'trelis'}, {}, self.session, [row], 0,20,
+                                            self.root/'cap.wav', lambda *args:result,
+                                            gate=self.keep_gate, defer_recovery=True)
+        self.assertEqual(evaluated['text'], result['text'])
+        self.assertIsNone(evaluated['alternative'])
+        self.assertIn('token_cap_reached', evaluated['quality_flags'])
+        self.assertIn('context_retry_pending', evaluated['quality_flags'])
+        with self.assertRaisesRegex(RuntimeError, 'device failed'):
+            worker.evaluate_window({'id':'trelis'}, {}, self.session,[row],0,20,self.root/'failed.wav',
+                lambda *args:{'status':'failed','error':'device failed'}, gate=self.keep_gate, defer_recovery=True)
+
+    def test_context_replaces_whole_range_and_re_recognizes_fringe_without_other_track_loss(self):
+        row = self.chunk(0,np.ones(60*16000)*1000)
+        before = file_digest(self.session/row['file'])
+        status, job, segment = self.recovery_fixture(row,20,40,previous=[(0,20,'earlier words')])
+        # A later retry may cut into an earlier context segment: IDs stay flat.
+        status['segments'][0]['id'] = status['job_id'] + '-microphone-c-0-320000'
+        system_row = self.chunk(0,np.ones(60*16000)*1500,track='system')
+        system = segment(0,60,'computer words','system',system_row)
+        status['segments'].insert(1,system)
+        originals = copy.deepcopy(status['segments'])
+        calls = []
+        def infer(spec,path,config):
+            calls.append(path.name)
+            return {'status':'ok','text':self.recovery_text}
+        self.assertTrue(worker.recover_pending_segment(status,job/'status.json',job,{'id':'trelis'}, {},
+                         self.session,[row],'microphone',True,infer=infer,gate=self.keep_gate))
+        mic = [s for s in status['segments'] if s['source_track']=='microphone']
+        self.assertEqual([(s['start_seconds'],s['end_seconds']) for s in mic],[(0,15),(15,45)])
+        self.assertEqual([s for s in status['segments'] if s['source_track']=='system'],[system])
+        self.assertEqual(len(calls),2)
+        self.assertEqual(status['cursors']['microphone'],45)
+        self.assertEqual(status['segments_revision'],3)
+        self.assertTrue(all(len(s['id'])<=100 for s in mic))
+        self.assertTrue(mic[0]['id'].endswith('-f-0-240000'))
+        context = mic[1]
+        self.assertEqual(context['text'],self.recovery_text)
+        self.assertEqual(context['recognition_original']['text'],originals[-1]['text'])
+        self.assertEqual(context['recovery']['method'],'context_window_retry')
+        self.assertEqual(set(context['replaces_segment_ids']),{originals[0]['id'], originals[-1]['id']})
+        self.assertEqual(len(status['superseded_segments']),2)
+        self.assertEqual(status['superseded_segments'][-1]['recovery']['state'],'waiting_for_context')
+        self.assertTrue(all(s['superseded_at_segments_revision']==3 for s in status['superseded_segments']))
+        self.assertEqual(file_digest(self.session/row['file']),before)
+
+    def test_bad_context_uses_five_second_fallback_even_when_pieces_still_loop(self):
+        row = self.chunk(0,np.ones(40*16000)*1000)
+        loop = 'वो जब था ' * 5
+        failures = ({'status':'ok','text':loop}, {'status':'failed','text':'','error':'recovery failed'},
+                    {'status':'ok','text':''}, {'status':'ok','text':'unfinished context',
+                     'decoding_diagnostics':{'token_cap_reached':True}})
+        for context_result in failures:
+            with self.subTest(context_result=context_result):
+                status,job,_ = self.recovery_fixture(row,10,20,previous=[(0,10,'earlier words')])
+                original = copy.deepcopy(status['segments'])
+                def infer(spec,path,config):
+                    return context_result if '-context-' in path.name else {'status':'ok','text':loop}
+                worker.recover_pending_segment(status,job/'status.json',job,{'id':'trelis'}, {},self.session,
+                                               [row],'microphone',True,infer=infer,gate=self.keep_gate)
+                self.assertEqual(status['segments'][0],original[0])
+                selected = status['segments'][1]
+                self.assertEqual(selected['id'],original[1]['id'])
+                self.assertEqual(selected['text'],loop+'\n\n'+loop)
+                self.assertEqual(selected['recovery']['method'],'shorter_window_retry')
+                self.assertIn('repeated_phrase',selected['quality_flags'])
+                self.assertFalse(selected['alternative']['long_repetition_resolved'])
+                self.assertEqual([a['kind'] for a in selected['recovery']['attempts']],
+                                 ['context_window_retry','shorter_window_retry','shorter_window_retry'])
+                self.assertEqual(status['cursors']['microphone'],20)
+                self.assertEqual(status['superseded_segments'][0]['id'],selected['id'])
+
+    def test_uncertain_nonzero_fringe_keeps_prior_words_and_ignores_gate_skip(self):
+        row = self.chunk(0,np.ones(60*16000)*1000)
+        failures = ({'status':'ok','text':''}, {'status':'failed','text':'','error':'fringe failed'},
+                    {'status':'ok','text':'वो जब था '*5}, {'status':'ok','text':'unfinished fringe',
+                     'decoding_diagnostics':{'token_cap_reached':True}})
+        for fringe_result in failures:
+            with self.subTest(fringe_result=fringe_result):
+                status,job,_ = self.recovery_fixture(row,20,40,previous=[(0,20,'earlier words')])
+                previous = copy.deepcopy(status['segments'][0])
+                calls = []
+                def infer(spec,path,config):
+                    calls.append(path.name)
+                    if '-fringe-' in path.name:return fringe_result
+                    return {'status':'ok','text':self.recovery_text}
+                def gate(path,config):
+                    return {**self.keep_gate(),'skip_stt': '-fringe-' in path.name}
+                worker.recover_pending_segment(status,job/'status.json',job,{'id':'trelis'}, {},self.session,
+                                               [row],'microphone',True,infer=infer,gate=gate)
+                self.assertEqual(status['segments'][0],previous)
+                selected = status['segments'][1]
+                self.assertEqual(selected['recovery']['method'],'shorter_window_retry')
+                fringe = selected['recovery']['attempts'][1]
+                self.assertEqual(fringe['kind'],'overlap_fringe')
+                self.assertTrue(fringe['audio_provenance']['speech_gate']['skip_overridden_for_overlap_fringe'])
+                self.assertFalse(fringe['audio_provenance']['speech_gate']['skip_stt'])
+                self.assertTrue(any('-fringe-' in call for call in calls))
+                self.assertEqual(len(status['superseded_segments']),1)
+
+    def assert_sparse_recovery_preserves_neighbor(self, sparse_kind):
+        row=self.chunk(0,np.ones(60*16000)*1000)
+        status,job,_=self.recovery_fixture(row,20,40,previous=[(0,20,self.recovery_text)])
+        previous=copy.deepcopy(status['segments'][0])
+        def infer(spec,path,config):
+            if '-context-' in path.name:
+                text='word' if sparse_kind=='context_window_retry' else self.recovery_text
+            else:
+                # One-word fringe and fallback pieces are both completed and nonempty.
+                # Sparse context/fringes cannot erase neighbors; fallback stays visible.
+                text='word'
+            return {'status':'ok','text':text}
+        worker.recover_pending_segment(status,job/'status.json',job,{'id':'trelis'}, {},self.session,
+                                       [row],'microphone',True,infer=infer,gate=self.keep_gate)
+        self.assertEqual(status['segments'][0],previous)
+        selected=status['segments'][1]
+        self.assertEqual(selected['recovery']['method'],'shorter_window_retry')
+        self.assertEqual(selected['text'],'\n\n'.join(['word']*4))
+        self.assertIn('suspiciously_sparse_text',selected['quality_flags'])
+        self.assertTrue(selected['alternative']['promoted'])
+        self.assertTrue(selected['alternative']['all_chunks_ok'])
+        sparse_attempt=next(a for a in selected['recovery']['attempts'] if a['kind']==sparse_kind)
+        self.assertIn('suspiciously_sparse_text',sparse_attempt['quality_flags'])
+        self.assertEqual(len(status['superseded_segments']),1)
+        self.assertEqual(status['superseded_segments'][0]['id'],selected['id'])
+        self.assertEqual(status['cursors']['microphone'],40)
+
+    def test_sparse_context_uses_five_second_fallback_and_preserves_neighbor(self):
+        self.assert_sparse_recovery_preserves_neighbor('context_window_retry')
+
+    def test_sparse_fringe_uses_five_second_fallback_and_preserves_neighbor(self):
+        self.assert_sparse_recovery_preserves_neighbor('overlap_fringe')
+
+    def test_empty_or_failed_context_fallback_retains_original_core(self):
+        row=self.chunk(0,np.ones(40*16000)*1000)
+        loop='वो जब था '*5
+        for failed in (False,True):
+            with self.subTest(failed=failed):
+                status,job,_=self.recovery_fixture(row,10,20,previous=[(0,10,'earlier words')])
+                def infer(spec,path,config):
+                    if '-context-' in path.name:return {'status':'ok','text':loop}
+                    return {'status':'failed' if failed else 'ok','text':'','error':'retry failure' if failed else None}
+                worker.recover_pending_segment(status,job/'status.json',job,{'id':'trelis'}, {},self.session,
+                                               [row],'microphone',True,infer=infer,gate=self.keep_gate)
+                selected=status['segments'][-1]
+                self.assertEqual(selected['text'],loop)
+                self.assertEqual(selected['recovery']['method'],'original')
+                self.assertFalse(selected['alternative']['promoted'])
+                self.assertEqual(status['superseded_segments'],[])
+                self.assertIn('repeated_phrase',selected['quality_flags'])
+                self.assertIn('needs_review',selected['quality_flags'])
+                self.assertEqual(status['segments_revision'],3)
+
+    def test_token_cap_without_repetition_can_select_clean_context(self):
+        row=self.chunk(0,np.ones(40*16000)*1000)
+        status,job,_=self.recovery_fixture(row,10,20,previous=[(0,10,'earlier words')],
+                    text='unfinished words',diagnostics={'token_cap_reached':True})
+        worker.recover_pending_segment(status,job/'status.json',job,{'id':'trelis'}, {},self.session,
+            [row],'microphone',True,infer=lambda *args:{'status':'ok','text':self.recovery_text,
+                 'decoding_diagnostics':{'token_cap_reached':False,'avg_logprob':None,'no_speech_probability':None}},
+            gate=self.keep_gate)
+        self.assertEqual(len(status['segments']),1)
+        selected=status['segments'][0]
+        self.assertEqual(selected['text'],self.recovery_text)
+        self.assertEqual((selected['start_seconds'],selected['end_seconds']),(0,30))
+        self.assertEqual(selected['recovery']['method'],'context_window_retry')
+        self.assertTrue(selected['recognition_original']['decoding_diagnostics']['token_cap_reached'])
+        self.assertNotIn('token_cap_reached',selected['quality_flags'])
+
+    def test_context_attempt_checkpoint_reuses_result_after_stop(self):
+        row = self.chunk(0,np.ones(60*16000)*1000)
+        status,job,_ = self.recovery_fixture(row,20,40,previous=[(0,20,'earlier words')])
+        calls = []
+        def infer(spec,path,config):
+            calls.append(path.name)
+            return {'status':'ok','text':self.recovery_text}
+        with self.assertRaises(worker._RecoveryInterrupted):
+            worker.recover_pending_segment(status,job/'status.json',job,{'id':'trelis'}, {},self.session,
+                [row],'microphone',True,infer=infer,gate=self.keep_gate,keep_running=lambda: not calls)
+        saved = read_json(job/'status.json')
+        self.assertEqual(saved['segments_revision'],2)
+        self.assertEqual(len(saved['segments'][-1]['recovery']['attempts']),1)
+        self.assertEqual(saved['segments'][-1]['recovery']['state'],'waiting_for_context')
+        worker.recover_pending_segment(saved,job/'status.json',job,{'id':'trelis'}, {},self.session,
+                                       [row],'microphone',True,infer=infer,gate=self.keep_gate)
+        self.assertEqual(sum('-context-' in name for name in calls),1)
+        self.assertEqual(sum('-fringe-' in name for name in calls),1)
+        self.assertEqual(saved['segments_revision'],3)
+        self.assertEqual(len(saved['superseded_segments']),2)
+        self.assertFalse(worker.recover_pending_segment(saved,job/'status.json',job,{'id':'trelis'}, {},
+                         self.session,[row],'microphone',True,infer=infer,gate=self.keep_gate))
+
+    def test_same_revision_attempt_checkpoints_have_newer_timestamps(self):
+        row=self.chunk(0,np.ones(60*16000)*1000)
+        status,job,_=self.recovery_fixture(row,20,40,previous=[(0,20,self.recovery_text)])
+        first=datetime(2026,10,7,12,0,0,100000,tzinfo=timezone.utc)
+        second=first+timedelta(microseconds=1)
+        snapshots=[]
+        original_write=worker.write_json
+        def checkpoint(path,value):
+            snapshots.append(copy.deepcopy(value))
+            original_write(path,value)
+        with patch.object(worker,'datetime') as clock, patch.object(worker,'write_json',side_effect=checkpoint):
+            clock.now.side_effect=[first,second]
+            worker.recover_pending_segment(status,job/'status.json',job,{'id':'trelis'}, {},self.session,
+                [row],'microphone',True,infer=lambda *args:{'status':'ok','text':self.recovery_text},
+                gate=self.keep_gate)
+        self.assertEqual(len(snapshots),2)
+        self.assertEqual([s['segments_revision'] for s in snapshots],[2,2])
+        self.assertEqual([s['updated_at'] for s in snapshots],[first.isoformat(),second.isoformat()])
+        self.assertLess(datetime.fromisoformat(snapshots[0]['updated_at']),
+                        datetime.fromisoformat(snapshots[1]['updated_at']))
+        self.assertEqual([len(s['segments'][-1]['recovery']['attempts']) for s in snapshots],[1,2])
+
+    def test_cached_recovery_rejects_changed_derived_audio(self):
+        row = self.chunk(0,np.ones(60*16000)*1000)
+        status,job,_ = self.recovery_fixture(row,20,40,previous=[(0,20,'earlier words')])
+        calls = []
+        def infer(*args):
+            calls.append(True)
+            return {'status':'ok','text':self.recovery_text}
+        with self.assertRaises(worker._RecoveryInterrupted):
+            worker.recover_pending_segment(status,job/'status.json',job,{'id':'trelis'}, {},self.session,
+                [row],'microphone',True,infer=infer,gate=self.keep_gate,keep_running=lambda: not calls)
+        changed = self.chunk(0,np.ones(60*16000)*2000)
+        with self.assertRaisesRegex(ValueError,'Recovery audio changed'):
+            worker.recover_pending_segment(read_json(job/'status.json'),job/'status.json',job,{'id':'trelis'}, {},
+                self.session,[changed],'microphone',True,infer=infer,gate=self.keep_gate)
+        self.assertEqual(len(calls),1)
+
+    def test_five_second_core_attempts_context_before_single_piece_fallback(self):
+        row = self.chunk(0,np.ones(40*16000)*1000)
+        status,job,_ = self.recovery_fixture(row,10,15,previous=[(0,10,'earlier words')])
+        calls = []
+        def infer(spec,path,config):
+            calls.append(path.name)
+            return {'status':'ok','text':'वो जब था '*5 if '-context-' in path.name else 'recovered five seconds'}
+        worker.recover_pending_segment(status,job/'status.json',job,{'id':'trelis'}, {},self.session,[row],
+                                       'microphone',True,infer=infer,gate=self.keep_gate)
+        self.assertEqual(len(calls),2)
+        self.assertIn('-context-',calls[0])
+        self.assertEqual(status['segments'][-1]['text'],'recovered five seconds')
+        self.assertEqual(status['segments'][-1]['recovery']['method'],'shorter_window_retry')
+
+    def transcription_job(self, rows, profile='trelis-20', final_time=None):
+        events = rows if final_time is None else [*rows,{'kind':'capture_stopped','at_seconds':final_time},
+                                                   {'kind':'capture_finalized'}]
+        self.journal(events)
+        registry = self.root/'models.json'
+        write_json(registry,{'models':[{'id':'trelis','decoding':{}}]})
+        config = self.root/'runtime.json'
+        write_json(config,{'registry_path':str(registry),'models':{'trelis':{}},'speech_gate':{}})
+        job = self.root/'run-job';job.mkdir()
+        request = job/'request.json'
+        write_json(request,{'job_id':'run-synthetic','session_dir':str(self.session),
+                            'profile':profile,'language_mode':'hinglish'})
+        return config,request
+
+    def run_synthetic(self, config, request, infer, sleep=None):
+        # Mock this worker's waiting clock, preserving manifest.py's independent
+        # real time.sleep for transient Windows JSON replacement retries.
+        with patch.object(socket.socket,'connect',socket.socket.connect), patch.object(socket.socket,'connect_ex',socket.socket.connect_ex), patch.object(socket,'create_connection',socket.create_connection), patch.object(worker,'parent_alive',return_value=True), patch.object(worker,'transcribe',side_effect=infer), patch.object(worker,'assess_window',side_effect=self.keep_gate), patch.object(worker,'time') as clock:
+            clock.sleep.side_effect=sleep or (lambda delay:self.fail('Unexpected wait for synthetic capture'))
+            return worker.run(config,request)
+
+    def test_live_pending_core_waits_while_other_track_continues_then_resumes_once(self):
+        mic = self.chunk(0,np.ones(20*16000)*1000)
+        system = self.chunk(0,np.ones(40*16000)*1200,track='system')
+        config,request = self.transcription_job([mic,system])
+        calls=[]
+        def infer(spec,path,runtime):
+            calls.append(path.name)
+            return {'status':'ok','text':'वो जब था '*5 if path.name=='microphone-0.wav'
+                    else 'The speaker continues with several ordinary distinct words in this complete audio window '+path.stem}
+        def advance_capture(delay):
+            saved=read_json(request.parent/'status.json')
+            self.assertEqual(saved['state'],'waiting_for_audio')
+            self.assertEqual(saved['phase'],'waiting_for_context')
+            self.assertEqual(saved['cursors'],{'microphone':20,'system':40})
+            self.assertEqual(saved['segments_revision'],3)
+            self.assertEqual(len(saved['segments'][0]['recovery']['attempts']),0)
+            self.assertEqual(saved['segments'][0]['text'],'वो जब था '*5)
+            future=self.chunk(1,np.ones(20*16000)*1400,start=20)
+            self.journal([mic,system,future,{'kind':'capture_stopped','at_seconds':40}, {'kind':'capture_finalized'}])
+        first=self.run_synthetic(config,request,infer,advance_capture)
+        self.assertEqual(first['state'],'complete', first.get('error'))
+        self.assertEqual(len(calls),5)
+        self.assertEqual(calls[:3],['microphone-0.wav','system-0.wav','system-320000.wav'])
+        self.assertIn('-context-',calls[3])
+        self.assertEqual(calls[4],'microphone-400000.wav')
+        self.assertEqual(first['cursors'],{'microphone':40,'system':40})
+        self.assertEqual(first['segments_revision'],5)
+        for track,expected in (('microphone',[(0,25),(25,40)]),('system',[(0,20),(20,40)])):
+            self.assertEqual([(s['start_seconds'],s['end_seconds']) for s in first['segments']
+                              if s['source_track']==track],expected)
+        self.assertEqual(len(first['superseded_segments']),1)
+        second=self.run_synthetic(config,request,infer)
+        self.assertEqual(len(calls),5)
+        self.assertEqual(first['segments'],second['segments'])
+        self.assertEqual(first['superseded_segments'],second['superseded_segments'])
+        self.assertEqual(second['segments_revision'],5)
+
+    def test_final_tail_context_never_pads_past_committed_audio(self):
+        row=self.chunk(0,np.ones(23*16000)*1000)
+        config,request=self.transcription_job([row],final_time=23)
+        calls=[]
+        def infer(spec,path,runtime):
+            with wave.open(str(path),'rb') as wav:duration=wav.getnframes()/wav.getframerate()
+            calls.append((path.name,duration))
+            return {'status':'ok','text':'वो जब था '*5 if path.name=='microphone-320000.wav' else self.recovery_text}
+        result=self.run_synthetic(config,request,infer)
+        self.assertEqual(result['state'],'complete')
+        self.assertEqual([s['end_seconds'] for s in result['segments']],[6.5,23])
+        self.assertEqual(result['cursors']['microphone'],23)
+        self.assertEqual([duration for name,duration in calls if '-context-' in name],[16.5])
+        context=result['segments'][-1]
+        self.assertEqual(context['recovery']['context_end_seconds'],23)
+        self.assertEqual(context['recovery']['desired_context_end_seconds'],36.5)
+        self.assertEqual(context['audio_provenance']['uncovered_seconds'],0)
+
+    def test_primary_failure_keeps_failure_state_cursor_and_original_source(self):
+        row=self.chunk(0,np.ones(20*16000)*1000)
+        config,request=self.transcription_job([row],final_time=20)
+        before=file_digest(self.session/row['file'])
+        result=self.run_synthetic(config,request,lambda *args:{'status':'failed','error':'synthetic GPU failure'})
+        self.assertEqual(result['state'],'failed')
+        self.assertIn('synthetic GPU failure',result['error'])
+        self.assertEqual(result['segments'],[])
+        self.assertEqual(result['cursors'],{})
+        self.assertEqual(result['segments_revision'],0)
+        self.assertEqual(file_digest(self.session/row['file']),before)
+
+    def test_stop_after_context_checkpoint_preserves_provisional_core_for_resume(self):
+        row=self.chunk(0,np.ones(45*16000)*1000)
+        config,request=self.transcription_job([row],final_time=45)
+        calls=[]
+        def infer(spec,path,runtime):
+            calls.append(path.name)
+            if '-context-' in path.name:
+                (request.parent/'stop.request').write_text('stop',encoding='utf-8')
+            return {'status':'ok','text':'वो जब था '*5 if path.name=='microphone-320000.wav' else self.recovery_text}
+        first=self.run_synthetic(config,request,infer)
+        self.assertEqual(first['state'],'stopped')
+        self.assertEqual(first['segments_revision'],2)
+        self.assertEqual(first['cursors']['microphone'],40)
+        self.assertEqual(first['segments'][-1]['recovery']['state'],'waiting_for_context')
+        self.assertEqual(len(first['segments'][-1]['recovery']['attempts']),1)
+        (request.parent/'stop.request').unlink()
+        second=self.run_synthetic(config,request,infer)
+        self.assertEqual(second['state'],'complete')
+        self.assertEqual(sum('-context-' in name for name in calls),1)
+        self.assertEqual(sum('-fringe-' in name for name in calls),1)
+        self.assertEqual(second['cursors']['microphone'],45)
+        self.assertEqual(second['segments_revision'],3)
+        self.assertEqual(len(second['superseded_segments']),2)
+
     def test_repetition_recognizes_three_word_loop_but_allows_short_repeats(self):
         for phrase in ('जब', 'वो जब', 'वो जब था', 'a b c d e f g h'):
             with self.subTest(phrase=phrase):
@@ -182,10 +615,10 @@ class LocalWorkerTests(unittest.TestCase):
             self.assertIsNone(result['alternative'])
             self.assertEqual('needs_review' in result['quality_flags'], len(text.split()) > 3)
 
-    def test_failed_or_still_looping_retry_keeps_original_and_failed_piece_audio(self):
+    def test_failed_retry_keeps_original_and_failed_piece_audio(self):
         loop = 'वो जब था ' * 5
         row = self.chunk(0, np.ones(10 * 16000) * 1000)
-        for outcome in ('failed', 'exception', 'persistent'):
+        for outcome in ('failed', 'exception'):
             calls = []
             def infer(*args):
                 calls.append(args)
@@ -195,7 +628,7 @@ class LocalWorkerTests(unittest.TestCase):
                     raise RuntimeError('synthetic model failure')
                 if len(calls) == 2 and outcome == 'failed':
                     return {'status': 'failed', 'error': 'synthetic model failure'}
-                return {'status': 'ok', 'text': loop if outcome == 'persistent' else 'speech recovered'}
+                return {'status': 'ok', 'text': 'speech recovered'}
             result = worker.evaluate_window({'id': 'trelis'}, {}, self.session, [row], 0, 10,
                                             self.root / 'failure.wav', infer, gate=self.keep_gate)
             self.assertEqual(len(calls), 3)
@@ -204,6 +637,38 @@ class LocalWorkerTests(unittest.TestCase):
             self.assertIn('needs_review', result['quality_flags'])
             self.assertEqual(len(result['alternative']['chunks'][0]['audio_provenance']['audio_sha256']), 64)
             self.assertIn('repeated_phrase', result['quality_flags'])
+
+    def test_still_looping_retry_selects_all_pieces_and_keeps_original_for_review(self):
+        loop = 'वो जब था ' * 5
+        row = self.chunk(0, np.ones(20 * 16000) * 1000)
+        before = file_digest(self.session / row['file'])
+        for pieces in (['पहले विषय पर बात करें', 'The deadline is Friday.',
+                        'अगला कदम तय करते हैं', 'ये प्रकार देते हैं कि ' * 17],
+                       [loop] * 4):
+            with self.subTest(pieces=pieces):
+                texts = iter([loop, *pieces])
+                calls = []
+                def infer(*args):
+                    calls.append(args)
+                    return {'status': 'ok', 'text': next(texts)}
+                result = worker.evaluate_window({'id': 'trelis'}, {}, self.session, [row], 0, 20,
+                                                self.root / 'persistent.wav', infer, gate=self.keep_gate)
+                joined = '\n\n'.join(pieces)
+                self.assertEqual(len(calls), 5)
+                self.assertEqual(result['text'], joined)
+                self.assertEqual(result['result']['text'], joined)
+                self.assertEqual(result['alternative']['text'], joined)
+                self.assertEqual(result['original_result']['text'], loop)
+                self.assertTrue(result['alternative']['promoted'])
+                self.assertTrue(result['alternative']['all_chunks_ok'])
+                self.assertFalse(result['alternative']['long_repetition_resolved'])
+                self.assertTrue(result['alternative']['requires_review'])
+                for flag in ('retry_applied', 'needs_review', 'repeated_phrase'):
+                    self.assertIn(flag, result['quality_flags'])
+                self.assertEqual([(p['start_seconds'], p['end_seconds'])
+                                  for p in result['alternative']['chunks']],
+                                 [(0, 5), (5, 10), (10, 15), (15, 20)])
+                self.assertEqual(file_digest(self.session / row['file']), before)
 
     def test_conservative_gate_skip_retains_nonzero_audio_and_unavailable_keeps_words(self):
         row = self.chunk(0, np.ones(20 * 16000) * 8)
@@ -271,11 +736,8 @@ class LocalWorkerTests(unittest.TestCase):
         def infer(spec, path, runtime):
             self.assertEqual(runtime['speech_gate'], gate_settings)
             calls.append(path)
-            return {'status': 'ok', 'text': 'वो जब था ' * 5 if len(calls) == 1 else f'recovered piece {len(calls)}'}
-        original = worker.evaluate_window
-        def evaluate(*args):
-            return original(*args, infer=infer, gate=self.keep_gate)
-        with patch.object(socket.socket, 'connect', socket.socket.connect), patch.object(socket.socket, 'connect_ex', socket.socket.connect_ex), patch.object(socket, 'create_connection', socket.create_connection), patch.object(worker, 'parent_alive', return_value=True), patch.object(worker, 'evaluate_window', side_effect=evaluate):
+            return {'status': 'ok', 'text': 'वो जब था ' * 5 if len(calls) in (1, 3) else 'recovered piece 2'}
+        with patch.object(socket.socket, 'connect', socket.socket.connect), patch.object(socket.socket, 'connect_ex', socket.socket.connect_ex), patch.object(socket, 'create_connection', socket.create_connection), patch.object(worker, 'parent_alive', return_value=True), patch.object(worker, 'transcribe', side_effect=infer), patch.object(worker, 'assess_window', side_effect=self.keep_gate):
             first = worker.run(config, request)
             second = worker.run(config, request)
         self.assertEqual(first['state'], 'complete')
@@ -284,7 +746,13 @@ class LocalWorkerTests(unittest.TestCase):
         self.assertEqual(second['cursors']['microphone'], 10)
         self.assertEqual(second['segments'][0]['recognition_original']['text'], 'वो जब था ' * 5)
         self.assertTrue(second['segments'][0]['alternative']['promoted'])
+        self.assertFalse(second['segments'][0]['alternative']['long_repetition_resolved'])
+        self.assertEqual(second['segments'][0]['text'], 'recovered piece 2\n\n' + 'वो जब था ' * 5)
+        self.assertIn('repeated_phrase', second['segments'][0]['quality_flags'])
         self.assertEqual(second['identity']['speech_gate'], gate_settings)
+        self.assertEqual(second['segments_revision'], 2)
+        self.assertEqual(second['segments'][0]['recovery']['method'], 'shorter_window_retry')
+        self.assertEqual(second['superseded_segments'][0]['id'], second['segments'][0]['id'])
         write_json(config, {**settings, 'speech_gate': {**gate_settings, 'threshold': .1}})
         with self.assertRaisesRegex(ValueError, 'Cannot resume changed'):
             worker.run(config, request)

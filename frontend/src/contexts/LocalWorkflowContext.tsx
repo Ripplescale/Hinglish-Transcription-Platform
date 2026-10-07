@@ -27,7 +27,7 @@ export function LocalWorkflowProvider({ children }: { children: React.ReactNode 
     changed: next => {
       setState(next);
       // Text is already durably stored by the worker. Keep only small workflow pointers here.
-      try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...next, speakerSetup: undefined, runs: next.runs.map(run => ({ ...run, job: run.job ? { ...run.job, segments: undefined } : undefined, speakerJob: run.speakerJob ? { ...run.speakerJob, result: undefined } : undefined })) })); } catch { /* Recording and native jobs do not depend on browser storage. */ }
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...next, speakerSetup: undefined, runs: next.runs.map(run => ({ ...run, job: run.job ? { ...run.job, segments: undefined, superseded_segments: undefined } : undefined, speakerJob: run.speakerJob ? { ...run.speakerJob, result: undefined } : undefined })) })); } catch { /* Recording and native jobs do not depend on browser storage. */ }
     },
     imported: meetingId => {
       void callbacks.current.refetchMeetings();

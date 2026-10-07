@@ -15,6 +15,30 @@ const second = { session_id: 'session-two', session_dir: 'C:\\STTApp\\recordings
 const third = { session_id: 'session-three', session_dir: 'C:\\STTApp\\recordings\\three' };
 const segment = (id = 'synthetic-one', text = 'मीरा ने seven notebooks कहा') => ({ id, text, source_track: 'system', start_seconds: 0, end_seconds: 20 });
 
+test('same-count context recovery revision reimports the selected text and survives reload', async () => {
+  const f = fixture(); await f.workflow.captureStarted(capture);
+  const live = f.live();
+  f.status(live, { segments: [segment('provisional', 'जब '.repeat(12).trim())], segments_revision: 1 });
+  await f.workflow.tick();
+  const imported = f.count('import_local_transcription');
+  const recovered = { ...segment('context-recovery', 'हाँ, seven notebooks and coloured pencils for the workshop.'), end_seconds: 30, replaces_segment_ids: ['provisional'] };
+  f.status(live, { segments: [recovered], segments_revision: 2 });
+  await f.workflow.tick();
+  assert.equal(f.count('import_local_transcription'), imported + 1);
+  assert.equal(live.importedCount, 1); assert.equal(live.importedRevision, 2);
+  assert.equal(live.job.segments[0].text, recovered.text);
+  await f.workflow.tick();
+  assert.equal(f.count('import_local_transcription'), imported + 1, 'unchanged revision is not imported repeatedly');
+  f.reload(); await f.workflow.refreshAfterReload(capture);
+  assert.equal(f.live().importedRevision, 2);
+  assert.equal(f.count('import_local_transcription'), imported + 1, 'reload retains the imported revision pointer');
+  f.status(f.live(), { segments: [{ ...recovered, text: 'हाँ, checked workshop details.' }], segments_revision: 3 });
+  f.failImport(f.live()); await f.workflow.tick();
+  assert.equal(f.live().importedRevision, 2, 'failed import does not advance the pointer');
+  f.failImport(f.live(), false); await f.workflow.tick();
+  assert.equal(f.live().importedRevision, 3);
+});
+
 function fixture(previous) {
   const calls = [], imports = [], stops = [], jobs = new Map(), speakers = new Map(), meetings = new Map(), bindings = new Map();
   const importFailures = new Set(), startFailures = new Set();

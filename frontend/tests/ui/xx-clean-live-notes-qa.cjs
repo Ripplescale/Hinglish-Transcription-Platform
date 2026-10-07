@@ -39,6 +39,7 @@ async function installCleanLiveFixture(page) {
     const emit = (event, payload) => { for (const [id, listener] of listeners) if (listener.event === event) callbacks.get(listener.handler)?.({ event, id, payload }); };
     window.qaCleanState = () => clone({ recording, paused, job, live, projects, notes, imported, hasMeeting });
     window.qaCleanSetText = () => { if (!job) throw Error('No synthetic job'); job.phase = 'transcribing'; job.segments = clone(raw); job.processed_audio_seconds = 40; job.available_audio_seconds = 40; job.backlog_seconds = 0; };
+    window.qaCleanSetSegments = (segments, metadata = {}) => { if (!job) throw Error('No synthetic job'); job.phase = 'transcribing'; job.segments = clone(segments); job.segments_revision = metadata.segments_revision ?? (job.segments_revision ?? 0) + 1; job.superseded_segments = clone(metadata.superseded_segments ?? []); if (metadata.workspace_corrections) live.corrections = clone(metadata.workspace_corrections); job.processed_audio_seconds = Math.max(0, ...segments.map(segment => segment.end_seconds ?? 0)); job.available_audio_seconds = job.processed_audio_seconds; job.backlog_seconds = 0; };
     window.qaCleanFailNextStart = false;
     window.qaCleanFailWorker = () => { if (!job) throw Error('No synthetic job'); job.state = 'failed'; job.error = 'Synthetic worker unavailable'; };
     window.qaCleanAddOrphan = () => { notes.push({ id: 'qa-orphan', title: 'Sketchbook colour discussion', created_at: '2026-10-04T09:00:00Z', project_id: 'missing-project', notes_preview: 'A saved fictional note whose project metadata is unavailable.' }); window.dispatchEvent(new Event('xx-projects-updated')); };
@@ -57,7 +58,7 @@ async function installCleanLiveFixture(page) {
         'ensure_capture_meeting', 'start_local_transcription', 'get_local_transcription_status',
         'list_local_transcription_jobs', 'import_local_transcription', 'get_local_transcript_layers',
         'get_local_transcript_groups', 'api_get_meetings', 'api_get_meeting_metadata',
-        'api_get_meeting_transcripts', 'api_save_meeting_title', 'load_transcript_workspace', 'save_meeting_note',
+        'api_get_meeting_transcripts', 'api_save_meeting_title', 'load_transcript_workspace', 'save_meeting_note', 'save_transcript_workspace',
       ].includes(command);
       if (!handled) {
         if (/^(start_|resume_|stop_|open_claude)|summary|outlook|calendar|oauth|plugin:opener/.test(command) && command !== 'api_get_summary') throw Error(`Unexpected side effect in clean fixture: ${command}`);
@@ -100,7 +101,14 @@ async function installCleanLiveFixture(page) {
       }
       if (command === 'list_local_transcription_jobs') return job ? [clone(job)] : [];
       if (command === 'get_local_transcription_status') return clone(job);
-      if (command === 'import_local_transcription') { imported = job.segments.map(segment => ({ ...segment, audio_start_time: segment.start_seconds, audio_end_time: segment.end_seconds, timestamp: '15:00' })); return { meeting_id: 'qa-live' }; }
+      if (command === 'import_local_transcription') {
+        imported = job.segments.map(segment => ({ ...segment, audio_start_time: segment.start_seconds, audio_end_time: segment.end_seconds, timestamp: '15:00' }));
+        live = { ...live, segments_revision: job.segments_revision, superseded_segments: clone(job.superseded_segments ?? []), segment_metadata: Object.fromEntries(job.segments.map(segment => [segment.id, {
+          source_track: segment.source_track, quality_flags: segment.quality_flags, recovery: segment.recovery, alternative: segment.alternative,
+          replaces_segment_ids: segment.replaces_segment_ids, original_recognition_text: segment.original_recognition_text ?? segment.recognition_original?.text,
+        }])) };
+        return { meeting_id: 'qa-live' };
+      }
       if (command === 'get_local_transcript_groups') return [{ meeting_id: 'qa-draft', source_meeting_id: 'qa-meeting', workflow_role: 'live-draft' }];
       if (command === 'get_local_transcript_layers' && args.meetingId === 'qa-live') return { source_meeting_id: 'qa-live', layers: [{ meeting_id: 'qa-live', title, profile: 'trelis-10', workflow_role: 'live-final', state: job?.state ?? 'running', job_id: job?.job_id, primary: true }] };
       if (command === 'api_get_meetings') { const rows = await original(command, args); return [...rows, ...(hasMeeting ? [{ id: 'qa-live', title, created_at: '2026-10-03T09:30:00Z', updated_at: '2026-10-03T09:30:00Z', folder_path: capture.session_dir }] : [])]; }
@@ -108,6 +116,11 @@ async function installCleanLiveFixture(page) {
       if (command === 'api_get_meeting_transcripts' && args.meetingId === 'qa-live') return { transcripts: clone(imported.slice(args.offset, args.offset + args.limit)), total_count: imported.length, has_more: false };
       if (command === 'api_save_meeting_title' && args.meetingId === 'qa-live') { title = args.title; return null; }
       if (command === 'load_transcript_workspace' && args.meetingId === 'qa-live') return clone(live);
+      if (command === 'save_transcript_workspace' && args.meetingId === 'qa-live') {
+        if (args.expectedRevision !== live.revision) throw Error('Revision conflict');
+        live = { ...live, notes: args.notes, corrections: clone(args.corrections), project_id: args.projectId, profile: args.profile, speaker_names: clone(args.speakerNames ?? {}), revision: live.revision + 1 };
+        return clone(live);
+      }
       if (command === 'save_meeting_note') {
         if (args.meetingId !== 'qa-live') throw Error('Unexpected note target');
         if (args.expectedRevision !== live.revision) throw Error('Revision conflict');

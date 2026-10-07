@@ -8,7 +8,7 @@ const source = fs.readFileSync(path.join(__dirname, '../../src/lib/transcript-wo
 const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS } });
 const context = { exports: {}, require };
 vm.runInNewContext(compiled.outputText, context);
-const { effectiveText, setCorrection, emptyWorkspace, mergeSavedWorkspace, makeTranscriptExport, fetchCompleteTranscript, recordingTime } = context.exports;
+const { earlierCorrections, effectiveText, setCorrection, emptyWorkspace, mergeSavedWorkspace, makeTranscriptExport, fetchCompleteTranscript, recordingTime } = context.exports;
 const segment = { id: 'one', text: 'सात notebooks for Mira', timestamp: '10:00', audio_start_time: 65 };
 
 test('native script and raw recognition survive correction and JSON export', () => {
@@ -78,4 +78,66 @@ test('a completed save from another meeting cannot replace the current workspace
   const current = { ...emptyWorkspace('new-meeting'), notes: 'Keep this' };
   const stale = { ...emptyWorkspace('old-meeting'), notes: 'Old response' };
   assert.equal(mergeSavedWorkspace(current, stale, false), current);
+});
+
+test('promoted shorter retry remains the exported text when one retry piece still repeats', () => {
+  const original = 'वो जब था '.repeat(18).trim();
+  const pieces = ['Please bring the notebooks.', Array(12).fill('जब').join(' '), 'The studio opens at three.', "Let's meet by the door."];
+  const combined = pieces.join('\n\n');
+  const promoted = { ...segment, id: 'retry-still-repeats', text: combined, audio_start_time: 60, audio_end_time: 80 };
+  const workspace = emptyWorkspace('meeting');
+  workspace.segment_metadata = { [promoted.id]: { source_track: 'system', timestamp_kind: 'audio_window',
+    original_recognition_text: original, quality_flags: ['repeated_phrase', 'retry_applied', 'needs_review'],
+    alternative: { text: combined, promoted: true, requires_review: true } } };
+  const metadataBefore = JSON.stringify(workspace.segment_metadata);
+  assert.equal(effectiveText(promoted, workspace.corrections), combined);
+  for (const format of ['txt', 'md', 'claude']) {
+    const output = makeTranscriptExport({ id: 'meeting', title: 'Retry review' }, [promoted], workspace, format);
+    assert.ok(output.includes(combined), `${format} keeps every retry piece in order, including the repeating piece`);
+    assert.ok(!output.includes(original), `${format} uses the combined retry as its transcript`);
+  }
+  const output = JSON.parse(makeTranscriptExport({ id: 'meeting', title: 'Retry review' }, [promoted], workspace, 'json'));
+  assert.equal(output.segments[0].text, combined);
+  assert.equal(output.segments[0].original_text, combined);
+  assert.equal(output.segments[0].retry_alternative.text, combined);
+  assert.equal(output.segments[0].retry_alternative.promoted, true);
+  assert.equal(output.segments[0].retry_alternative.requires_review, true);
+  assert.ok(output.segments[0].quality_flags.includes('needs_review'));
+  assert.equal(JSON.stringify(workspace.segment_metadata), metadataBefore, 'export preserves the saved original recognition and review flags');
+  assert.equal(workspace.segment_metadata[promoted.id].original_recognition_text, original);
+});
+
+test('context selection is copied once with its wider range and preserved archived correction provenance', () => {
+  const repeated = 'जब '.repeat(12).trim();
+  const selected = { ...segment, id: 'context-selected', text: 'पहले room confirmed. We need seven notebooks. Then bring coloured pencils.', audio_start_time: 50, audio_end_time: 80 };
+  const unaffected = { ...segment, id: 'after-context', text: 'Next agenda item.', audio_start_time: 80, audio_end_time: 90 };
+  const workspace = emptyWorkspace('meeting');
+  workspace.segments_revision = 4;
+  workspace.superseded_segments = [{ id: 'core', text: repeated, start_seconds: 60, end_seconds: 70, source_track: 'system', superseded_by: [selected.id], superseded_at_segments_revision: 4 }];
+  workspace.corrections = [{ segment_id: 'core', original_text: repeated, text: 'My checked earlier correction', updated_at: 'now' },
+    { segment_id: 'unloaded-page', original_text: 'An unshown active row', text: 'Keep this active correction', updated_at: 'now' }];
+  workspace.segment_metadata = { [selected.id]: { source_track: 'system', original_recognition_text: repeated, quality_flags: ['retry_applied', 'needs_review'], replaces_segment_ids: ['before-core', 'core', 'after-core'],
+    recovery: { state: 'complete', method: 'context_window_retry', core_segment_id: 'core', core_start_seconds: 60, core_end_seconds: 70,
+      context_start_seconds: 50, context_end_seconds: 80, requires_review: true, attempts: [{ kind: 'context_window_retry', start_seconds: 50, end_seconds: 80, source_audio_sha256: 'fictional-audio-hash', quality_flags: [] }] } } };
+  const metadataBefore = JSON.stringify(workspace);
+  assert.equal(effectiveText(selected, workspace.corrections), selected.text);
+  const sameIdReplacement = { ...selected, id: 'core' };
+  assert.equal(effectiveText(sameIdReplacement, workspace.corrections), selected.text, 'a same-ID fallback cannot inherit a correction for earlier raw text');
+  assert.deepEqual(Array.from(earlierCorrections([sameIdReplacement], workspace), item => item.segment_id), ['core']);
+  assert.deepEqual(Array.from(earlierCorrections([selected, unaffected], workspace), item => item.segment_id), ['core'], 'only a confirmed archived source is listed, not unloaded pagination');
+  for (const format of ['txt', 'md', 'claude']) {
+    const output = makeTranscriptExport({ id: 'meeting', title: 'Context review' }, [selected, unaffected], workspace, format);
+    assert.equal(output.split(selected.text).length - 1, 1);
+    assert.ok(output.includes('[00:50] (system track) ' + selected.text));
+    assert.ok(output.includes(unaffected.text));
+    assert.ok(!output.includes(repeated)); assert.ok(!output.includes('My checked earlier correction'));
+  }
+  const output = JSON.parse(makeTranscriptExport({ id: 'meeting', title: 'Context review' }, [selected, unaffected], workspace, 'json'));
+  assert.equal(output.segments[0].text, selected.text); assert.equal(output.segments[0].start_seconds, 50); assert.equal(output.segments[0].end_seconds, 80);
+  assert.equal(output.segments_revision, 4); assert.deepEqual(output.superseded_segments, workspace.superseded_segments);
+  assert.deepEqual(output.segments[0].recovery, workspace.segment_metadata[selected.id].recovery);
+  assert.deepEqual(output.segments[0].replaces_segment_ids, ['before-core', 'core', 'after-core']);
+  assert.equal(output.segments[0].original_recognition_text, repeated);
+  assert.equal(output.corrections[0].text, 'My checked earlier correction');
+  assert.equal(JSON.stringify(workspace), metadataBefore, 'reading and export never mutate selected recovery or archived corrections');
 });

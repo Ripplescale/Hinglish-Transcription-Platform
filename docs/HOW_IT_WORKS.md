@@ -6,9 +6,9 @@ oats keeps audio as the source of truth and treats transcripts as editable inter
 
 1. **Open a new note.** Choose a project on the home screen, then click New note. This action starts microphone and system-audio capture and opens the writing canvas. Tracks are written independently with a session manifest and timing journal. Capture does not depend on a model loading successfully. Recording options remain available in the bottom bar.
 2. **Save before inference.** The worker builds bounded mono windows from saved audio on the session clock. Gaps and interruptions remain visible. Original tracks stay available for recovery.
-3. **Write while oats listens.** Notes autosave independently. Open the transcript with the microphone/up-arrow control when you want to check it. Choose Trelis windows of 5, 10, or 20 seconds; new settings default to 10 seconds. A conservative Silero gate checks each window before local OpenVINO GPU inference and retains uncertain speech. Trelis preserves the original Hindi/English script.
+3. **Write while oats listens.** Notes autosave independently. Open the transcript with the microphone/up-arrow control when you want to check it. Computer audio appears in chat bubbles on the left and microphone audio on the right, in the existing transcript order. These labels identify recording sources, not individual speakers; older text without a known source stays neutral. Choose Trelis windows of 5, 10, or 20 seconds; new settings default to 10 seconds. A conservative Silero gate checks each window before local OpenVINO GPU inference and retains uncertain speech. Trelis preserves the original Hindi/English script.
 4. **Stop and finish remaining audio.** Stopping capture lets the same Trelis job drain its backlog and process the final partial window. The display changes from Live transcript to Finishing transcript, then Final transcript on completion. There is no second full pass. “Final” means processing finished, not human verification.
-5. **Flag suspicious output.** Quiet input, gaps, repetition, or substantial audio with sparse text can trigger flags. Long repeated phrases in a Trelis window longer than 5 seconds trigger one retry in disjoint 5-second pieces. Successful pieces without another long loop replace the displayed result; original recognition and retry provenance remain saved. Failed or still repetitive retries retain the original result and require review. A 5-second primary window is not retried recursively.
+5. **Recover suspicious output.** Long repeated phrases or a reached generation limit trigger a retry using a neighborhood of up to 30 seconds. While recording, the app waits for the needed following audio and keeps the original text visible as provisional. A clean, nonempty retry replaces its covered range. Any untouched part of a neighboring window is transcribed separately, so the replacement neither duplicates that range nor guesses which words to trim. If that cannot be completed reliably, the app retries the original window in pieces of at most 5 seconds. A completed, nonempty combined fallback becomes the displayed and copied text even if repetition remains. Failed or entirely empty fallbacks retain the original. Every recovery remains marked for review, with originals and attempts preserved.
 6. **Review speakers.** Optional Community-1 runs after recording and transcription complete. Turns are mapped to transcript windows, overlapping candidates remain explicit, and manual names survive reconciliation. Live individual speaker identification remains future work.
 7. **Keep notes or hand off.** Review the transcript, edit text, name speakers, add notes, and play the related audio. Trelis remains the primary version; an explicitly requested Apex fallback has its own notes and corrections. Export or hand the selected version to Claude yourself.
 
@@ -39,24 +39,27 @@ flowchart TD
     C --> D{"Does Silero detect speech?"}
     D -->|No| E["Skip this piece"]
     D -->|"Yes or unsure"| F["Trelis turns the speech into text"]
-    F --> G{"Is the text stuck repeating?"}
+    F --> G{"Is the text stuck repeating<br/>or cut short by its length limit?"}
     G -->|No| H["Keep the text"]
-    G -->|Yes| I{"Already a 5-second piece?"}
-    I -->|Yes| J["Keep the original text<br/>Mark it for review"]
-    I -->|No| K["Try once more in 5-second pieces<br/>Check for speech in each piece"]
-    K --> L{"Did the retry produce text<br/>without another repetition loop?"}
-    L -->|Yes| M["Use the new text<br/>Keep the original for comparison"]
-    L -->|"No or retry failed"| J
+    G -->|Yes| I["Keep the first text visible<br/>Wait for nearby audio if still recording"]
+    I --> P["Try again with surrounding audio<br/>Up to 30 seconds in total"]
+    P --> Q{"Is the new text usable<br/>and can neighboring speech be preserved?"}
+    Q -->|Yes| R["Replace the covered range<br/>Keep the original for comparison"]
+    Q -->|No| K["Try the original piece in parts<br/>of at most 5 seconds"]
+    K --> L{"Did all retry pieces finish<br/>with some text overall?"}
+    L -->|Yes| M["Show and copy the combined new text<br/>Keep the original for comparison<br/>Mark it for review, even if it still repeats"]
+    L -->|"No text or retry failed"| J["Keep the original text<br/>Mark it for review"]
     E --> N["Continue with the next piece<br/>until the recording is finished"]
     H --> N
     J --> N
     M --> N
+    R --> N
     N --> C
 ```
 
-Even one second of detected speech keeps the whole piece. If the speech check is unsure or fails, the app still tries to transcribe it. The original recording is always kept, and retried text is marked for review. There is only one retry; a 5-second piece is never split again. If transcription fails, the recording remains available to try again later.
+Even one second of detected speech keeps the whole piece. If the speech check is unsure or fails, the app still tries to transcribe it. The original recording is always kept, and retried text is marked for review. Recovery is bounded: one surrounding-audio attempt followed by at most one pass through the original piece in 5-second parts. Retry pieces are never split recursively. At the beginning or end of a recording, surrounding audio is limited to what was actually saved. If transcription fails, the recording remains available to try again later.
 
-The app can also offer a shorter retry when there is substantial audio but surprisingly little text. These checks help with specific problems and do not guarantee accurate transcription. Soft repetition penalties were tested separately and are not enabled in this flow.
+The app can also offer a shorter retry when there is substantial audio but surprisingly little text. Generation diagnostics record the observed token count, end marker, length-limit status and text compression. Confidence and no-speech scores are unavailable in this adapter and never erase recognized speech. These checks do not guarantee accurate transcription. Soft repetition penalties were tested separately and are not enabled in this flow.
 
 ## Models and timing
 
@@ -81,7 +84,7 @@ The replay **did not pass the strict timing gate**. First text appeared at 49.8 
 
 The earlier single-track warm extrapolation of roughly 12–15 minutes for a 90-minute recording, or 24–30 minutes for two fully processed tracks, remains only a planning estimate before startup, retries and speakers. The live workflow normally finishes only the remaining queued audio after stop, so a full post-call estimate does not describe its usual behavior. These engine-study measurements predate the conservative speech gate and the 5/10-second profiles.
 
-Silero checks the full window on CPU, including an analysis-only amplified pass to protect quiet speech. It skips a window only when both passes remain below the conservative threshold; even a brief detected utterance keeps the full window. Missing models, unsupported interfaces, or detection errors retain the audio and attach a warning. The ASR waveform is not amplified or denoised by this gate. Setup copies a verified local ONNX asset into a durable model directory; no inference download occurs.
+Silero checks each microphone and system window independently on CPU in 512-sample frames at 16 kHz (32 milliseconds), including an analysis-only amplified pass to protect quiet speech. New worker candidates use the verified 6.2.3 ONNX asset with its additional 64-sample context; earlier job snapshots retain their original model. The analysis gain targets a peak amplitude of 0.25: `min(1000, max(1, 0.25 / original_peak))`. This uses the loudest sample, not an estimate of the noise floor. It skips a window only when both passes remain below the conservative threshold of 0.15; one frame at or above that threshold keeps the full window, with no minimum speech-duration requirement. Missing models, unsupported interfaces, or detection errors retain the audio and attach a warning. The ASR waveform is not amplified or denoised by this gate. Setup copies a verified ONNX asset into a durable model directory, from a supplied local file or explicit provisioning download; inference never downloads it.
 
 Chunk boundaries and decoding can affect omissions and repetition. Language biases, ambiguous acoustics, overlap, and recording quality can affect names, numbers, and unit words. A retry cannot reconstruct speech that was never recorded, and a glossary does not prove what was said. Flags narrow review work; they do not guarantee an error-free transcript.
 
@@ -97,7 +100,7 @@ Duplicate events, reloads, and recovery retain job identities instead of creatin
 
 ## Text, speakers, notes, and knowledge
 
-Each ASR job keeps its model/configuration identity and original output. The Trelis live and completed transcript belong to the same job; completed chunks are appended without replacing recognition already saved. An Apex fallback has a different job and workspace. Corrections, notes, and speaker assignments remain version-specific with their own history. A correction made to Apex is not silently transferred to Trelis. Playback retains the related audio context.
+Each ASR job keeps its model/configuration identity and original output. The Trelis live and completed transcript belong to the same job. Recoveries update a canonical selection with a separate revision counter, so changing text does not depend on adding a new row. Replaced recognition is archived before selected rows change. Corrections to earlier text remain visible as references and are never silently applied to different recognition, including an open correction draft. An Apex fallback has a different job and workspace. Corrections, notes, and speaker assignments remain version-specific with their own history. Playback retains the related audio context.
 
 The optional project Vault stores verified terms, names, quantities, relationships, and sources. Quantity entries require context and units. It does not currently fine-tune models, train on calls, or automatically replace words in a transcript.
 

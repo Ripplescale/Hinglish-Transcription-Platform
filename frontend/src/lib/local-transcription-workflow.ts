@@ -1,17 +1,18 @@
 /** Coordinates durable native jobs; capture and model inference stay outside this class. */
+import type { TranscriptSegmentMetadata, TranscriptArchivedSegment } from './transcript-workspace';
 export type WorkflowRole = 'live-draft' | 'final' | 'live-final' | 'fallback';
 export type TrelisProfileId = 'trelis-5' | 'trelis-10' | 'trelis-20';
 export type LocalProfileId = TrelisProfileId | 'apex-20';
 export interface LocalProfile { id: string; model: string; chunk_seconds: number; available: boolean; reason?: string; live_qualified: boolean }
-export interface LocalSegment { id: string; text: string; source_track: string; start_seconds?: number; end_seconds?: number; quality_flags?: string[] }
-export interface LocalJob { job_id: string; session_dir: string; profile: string; final_profile?: TrelisProfileId; state: string; phase?: string; workflow_role?: WorkflowRole; capture_session_id?: string; language_mode?: 'hinglish' | 'english'; processed_audio_seconds?: number; available_audio_seconds?: number; backlog_seconds?: number; segments?: LocalSegment[]; error?: string }
+export interface LocalSegment extends TranscriptSegmentMetadata { id: string; text: string; source_track: string; start_seconds?: number; end_seconds?: number; recognition_original?: { text?: string } }
+export interface LocalJob { job_id: string; session_dir: string; profile: string; final_profile?: TrelisProfileId; state: string; phase?: string; workflow_role?: WorkflowRole; capture_session_id?: string; language_mode?: 'hinglish' | 'english'; processed_audio_seconds?: number; available_audio_seconds?: number; backlog_seconds?: number; segments?: LocalSegment[]; segments_revision?: number; superseded_segments?: TranscriptArchivedSegment[]; error?: string }
 export interface LocalPreferences { profile: LocalProfileId; languageMode: 'hinglish' | 'english'; timing: 'after-recording' | 'during-recording' }
 export interface SpeakerJob { job_id: string; state: string; error?: string; result?: unknown }
 export interface SpeakerSetup { available: boolean; enabled?: boolean; reason?: string }
 export interface CaptureSession { session_id: string; session_dir: string }
 export interface WorkflowRun {
   capture: CaptureSession; meetingId?: string; transcriptMeetingId?: string; preferences: LocalPreferences;
-  recording: boolean; job?: LocalJob; error?: string; importedCount?: number; importedState?: string;
+  recording: boolean; job?: LocalJob; error?: string; importedCount?: number; importedState?: string; importedRevision?: number;
   primary: boolean; role?: WorkflowRole; speakerJob?: SpeakerJob; speakerError?: string; needsRecovery?: boolean;
   draftSkipped?: boolean; stopRequested?: boolean; stopAttempted?: boolean; stopError?: string;
   pausedByUser?: boolean; resumeRequested?: boolean; captureEnded?: boolean; stopNotified?: boolean;
@@ -196,14 +197,16 @@ export class LocalWorkflow {
     if (this.startingRun === draft) return false;
     if (!draft.job) return !!draft.draftSkipped;
     return isTerminalJob(draft.job.state) && Array.isArray(draft.job.segments)
-      && draft.importedCount === draft.job.segments.length && draft.importedState === draft.job.state;
+      && draft.importedCount === draft.job.segments.length && draft.importedState === draft.job.state
+      && draft.importedRevision === draft.job.segments_revision;
   }
   private checkpointSettled(run?: WorkflowRun) {
     if (!run) return true;
     if (this.startingRun === run) return false;
     if (!run.job) return true;
     return isTerminalJob(run.job.state) && Array.isArray(run.job.segments)
-      && run.importedCount === run.job.segments.length && run.importedState === run.job.state;
+      && run.importedCount === run.job.segments.length && run.importedState === run.job.state
+      && run.importedRevision === run.job.segments_revision;
   }
   private eligible(run: WorkflowRun) {
     if (run.pausedByUser || run.needsRecovery || run.error || !run.meetingId) return false;
@@ -386,9 +389,10 @@ export class LocalWorkflow {
             }
             if (isTerminalJob(run.job.state)) run.stopError = undefined;
             const count = run.job.segments?.length ?? 0;
-            if (run.meetingId && run.job.segments && (count !== (run.importedCount ?? -1) || run.job.state !== run.importedState)) {
+            // A recovered range can replace text without changing the segment count.
+            if (run.meetingId && run.job.segments && (count !== (run.importedCount ?? -1) || run.job.state !== run.importedState || run.job.segments_revision !== run.importedRevision)) {
               const result = await this.dependencies.invoke<{ meeting_id: string }>('import_local_transcription', { jobId: run.job.job_id, meetingId: run.meetingId, primary: run.primary });
-              run.transcriptMeetingId = result.meeting_id; run.importedCount = count; run.importedState = run.job.state;
+              run.transcriptMeetingId = result.meeting_id; run.importedCount = count; run.importedState = run.job.state; run.importedRevision = run.job.segments_revision;
               run.error = run.needsRecovery ? 'The recording was interrupted. Recover its saved audio before resuming transcription.' : run.stopError;
               this.dependencies.imported(result.meeting_id);
             }

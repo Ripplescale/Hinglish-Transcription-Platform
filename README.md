@@ -17,7 +17,7 @@ oats is a local Windows desktop app for recording calls, keeping the audio, and 
 - Provides **Project memory**: source-linked saved-note excerpts and checked project references. It does not generate facts or infer a knowledge graph from unverified speech.
 - Records microphone and system audio into separate local tracks, with a recovery journal written before transcription.
 - Offers a small **Record call / Dismiss** prompt when Zoom or Teams desktop activates its microphone. Recording starts only after you choose; no calendar connection is needed. [Detection limits and settings](docs/MEETING_DETECTION.md).
-- Offers **Trelis chunks of 5, 10, or 20 seconds**, with 10 seconds as the default for new settings. OpenVINO GPU FP16 preserves the original Hindi/English script. A conservative speech check skips confident nonspeech, and long repetitions get one retry in 5-second pieces. The same job finishes any remaining saved audio after you stop.
+- Offers **Trelis chunks of 5, 10, or 20 seconds**, with 10 seconds as the default for new settings. OpenVINO GPU FP16 preserves the original Hindi/English script. Silero checks microphone and computer audio separately. Repeating or token-limited text first gets a retry with surrounding audio, then a bounded 5-second fallback if needed. The same job finishes remaining saved audio after you stop.
 - Offers **Apex · 20 seconds** as an explicit fallback. Trelis pauses after its current window, then Apex replays the saved audio into a separate Roman Hinglish version.
 - Retains raw output, separate corrections, and history. “Final transcript” means the Trelis job completed; it remains unreviewed machine output until you check it.
 - Keeps recordings, transcripts, notes, speaker review, and playback together.
@@ -29,7 +29,11 @@ oats is a local Windows desktop app for recording calls, keeping the audio, and 
 
 Read **[Windows setup](docs/SETUP.md)** for the existing installation and developer setup path. **[How it works](docs/HOW_IT_WORKS.md)** explains capture, models, revisions, retries, and storage. **[Privacy](PRIVACY_POLICY.md)** describes local processing and manual export.
 
-See [oats 0.7.3 release notes](docs/releases/0.7.3.md) for the Peach Buddy design and the paired desktop/worker update.
+See [oats 0.7.4 release notes](docs/releases/0.7.4.md) for speech recovery, chat bubbles, and the paired desktop/worker update.
+
+Computer speech appears on the left and microphone speech on the right. These labels identify audio sources; optional speaker processing remains separate. The preview below uses fictional text.
+
+![Fictional oats transcript with computer and microphone speech bubbles](docs/assets/oats-transcript-bubbles.png)
 
 The everyday flow is **choose a project → New note → write while oats records → stop → review/export**. The transcript starts collapsed and continues processing in the background. Updates use the chosen chunk length **plus processing and queueing time**, and GPU startup adds initial delay. One heavy worker runs at a time, so back-to-back calls can queue; recording continues independently. A GPU failure is shown explicitly, without silently switching Trelis to CPU. Choose Apex fallback or retry when ready. Existing transcript versions, including older Apex-draft/Trelis-final calls, keep their original workflow and corrections.
 

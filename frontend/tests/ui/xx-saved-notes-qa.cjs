@@ -30,15 +30,29 @@ async function main() {
   try {
     await installFixture(page);
     await page.addInitScript(() => {
+      window.qaRetryPieces = ['Please bring the notebooks.', Array(12).fill('जब').join(' '), 'The studio opens at three.', "Let's meet by the door."];
+      window.qaRetryText = window.qaRetryPieces.join('\n\n');
+      window.qaRetryOriginal = 'वो जब था '.repeat(18).trim();
+      window.qaClipboard = '';
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async text => { window.qaClipboard = String(text); } } });
       window.qaWorkspace().segment_metadata.first = {
         source_track: 'system', timestamp_kind: 'audio_window', quality_flags: ['retry_applied', 'needs_review'],
         original_recognition_text: 'वो जब था '.repeat(5),
         alternative: { text: 'Welcome back, everyone. आज Project Willow की workshop plan करते हैं. Maya, would you like to walk us through the new sketchbook idea?', promoted: true, requires_review: true },
       };
+      window.qaWorkspace().segment_metadata.fourth = {
+        source_track: 'microphone', timestamp_kind: 'audio_window', quality_flags: ['repeated_phrase', 'retry_applied', 'needs_review'],
+        original_recognition_text: window.qaRetryOriginal,
+        alternative: { text: window.qaRetryText, promoted: true, requires_review: true },
+      };
       const invoke = window.__TAURI_INTERNALS__.invoke;
       window.qaSaveDelay = 0; window.qaFailSave = false; window.qaSaveFailures = 0;
       window.__TAURI_INTERNALS__.invoke = async (command, args = {}) => {
         if (command === 'list_project_library') return { projects: [{ id: 'willow', name: 'Project Willow Vault', revision: 0, entry_count: 1 }], meetings: [] };
+        if (command === 'api_get_meeting_transcripts') {
+          const result = await invoke(command, args);
+          return { ...result, transcripts: result.transcripts.map(segment => segment.id === 'fourth' ? { ...segment, text: window.qaRetryText } : segment) };
+        }
         if (command === 'save_transcript_workspace') {
           if (window.qaSaveDelay) await new Promise(resolve => setTimeout(resolve, window.qaSaveDelay));
           if (window.qaFailSave) { window.qaSaveFailures++; throw Error('Fictional disk write failure'); }
@@ -98,6 +112,30 @@ async function main() {
     await legacyRetry.getByText('Processing checks', { exact: true }).click();
     await legacyRetry.getByText('A shorter-window retry is available for comparison. It has not replaced the original recognition.', { exact: true }).waitFor();
     await legacyRetry.getByText('A shorter-window comparison is available for review.', { exact: true }).waitFor();
+    const stillRepeatingRetry = transcript.locator('article').nth(3);
+    const retryEvidence = await page.evaluate(() => ({ combined: window.qaRetryText, original: window.qaRetryOriginal,
+      metadata: structuredClone(window.qaWorkspace().segment_metadata.fourth) }));
+    await stillRepeatingRetry.getByText(retryEvidence.combined, { exact: true }).waitFor();
+    await stillRepeatingRetry.getByText('Processing checks', { exact: true }).click();
+    await stillRepeatingRetry.getByText('A shorter-window retry was selected for this transcript. Review it against the recording.', { exact: true }).waitFor();
+    assert.match(await stillRepeatingRetry.innerText(), /repeated phrase.*retry applied.*needs review/);
+    await stillRepeatingRetry.getByText('Recognition before shorter retry', { exact: true }).click();
+    await stillRepeatingRetry.getByText(retryEvidence.original, { exact: true }).waitFor();
+    await stillRepeatingRetry.scrollIntoViewIfNeeded();
+    await page.screenshot({ path: path.join(output, 'promoted-retry-still-repeats.png') }); report.screenshots.push('promoted-retry-still-repeats.png');
+    await transcript.getByRole('button', { name: 'Export', exact: true }).click();
+    await page.getByRole('menuitem', { name: 'Copy only', exact: true }).click();
+    await page.waitForFunction(() => !!window.qaClipboard);
+    const clipboardEvidence = await page.evaluate(() => ({ clipboard: window.qaClipboard,
+      metadata: window.qaWorkspace().segment_metadata.fourth, calls: window.qaCalls }));
+    assert.ok(clipboardEvidence.clipboard.includes(retryEvidence.combined), 'Copy includes all four5-second pieces in order, including the remaining repetition');
+    assert.ok(!clipboardEvidence.clipboard.includes(retryEvidence.original), 'The20-second recognition remains reference material, not the copied transcript');
+    assert.deepEqual(clipboardEvidence.metadata, retryEvidence.metadata, 'Display and copy preserve original recognition and needs_review');
+    assert.ok(clipboardEvidence.metadata.quality_flags.includes('needs_review'));
+    assert.equal(clipboardEvidence.metadata.alternative.requires_review, true);
+    assert.equal(clipboardEvidence.metadata.alternative.promoted, true);
+    assert.ok(!clipboardEvidence.calls.some(call => /open_claude/.test(call.command)), 'Copy only does not open Claude');
+    report.checks.push('Combined5-second retry is displayed and copied even with a repetitive piece; original20-second recognition remains available and needs_review survives');
     await page.getByRole('button', { name: 'Hide transcript', exact: true }).click();
     report.checks.push('Promoted retries show the preserved pre-retry recognition; legacy comparison-only retries keep accurate unchanged wording');
 

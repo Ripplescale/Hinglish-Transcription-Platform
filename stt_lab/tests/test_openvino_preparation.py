@@ -1,11 +1,14 @@
 """Preparation and migration use synthetic files, never inference or production."""
 import copy
+import hashlib
+import io
 import json
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import zipfile
 
 TOOLS=Path(__file__).resolve().parents[1]/'tools'
 sys.path.insert(0,str(TOOLS))
@@ -251,8 +254,10 @@ class SpeechGateProvisioningTests(unittest.TestCase):
         self.root=Path(self.temp.name)
 
     def test_missing_model_remains_explicit_without_suppressing_input(self):
-        configuration=installer.install_speech_gate(self.root)
+        with patch.object(installer.urllib.request,'urlopen',side_effect=AssertionError('offline setup must not access network')):
+            configuration=installer.install_speech_gate(self.root)
         self.assertEqual(configuration['model_sha256'],installer.SILERO_SHA256)
+        self.assertEqual(configuration['model_version'],'6.2.3')
         self.assertEqual(configuration['threshold'],0.15)
         self.assertFalse(Path(configuration['model_path']).exists())
 
@@ -266,6 +271,8 @@ class SpeechGateProvisioningTests(unittest.TestCase):
             original=target.stat().st_mtime_ns
             self.assertEqual(installer.install_speech_gate(self.root,source),configuration)
             self.assertEqual(target.stat().st_mtime_ns,original)
+            with patch.object(installer,'_download_silero_model',side_effect=AssertionError('verified asset must be reused')):
+                self.assertEqual(installer.install_speech_gate(self.root,download=True),configuration)
             target.write_bytes(b'tampered')
             with self.assertRaisesRegex(ValueError,'differs from the pinned'):
                 installer.install_speech_gate(self.root)
@@ -274,6 +281,58 @@ class SpeechGateProvisioningTests(unittest.TestCase):
         source=self.root/'provided.onnx';source.write_bytes(b'unverified')
         with self.assertRaisesRegex(ValueError,'pinned SHA-256'):
             installer.install_speech_gate(self.root,source)
+        self.assertFalse((self.root/'lab/models').exists())
+
+    def wheel(self, model=b'synthetic verified ONNX member'):
+        buffer=io.BytesIO()
+        with zipfile.ZipFile(buffer,'w') as archive:
+            archive.writestr(installer.SILERO_MODEL_MEMBER,model)
+            # Model setup reads exactly one member and never imports wheel code.
+            archive.writestr('silero_vad/__init__.py','raise RuntimeError("must not execute package")')
+        return buffer.getvalue(),model
+
+    def response(self, data, url=installer.SILERO_WHEEL_URL):
+        class Response(io.BytesIO):
+            def geturl(self):return url
+        return Response(data)
+
+    def test_explicit_setup_download_verifies_wheel_and_model_then_reuses_offline(self):
+        wheel,model=self.wheel()
+        with patch.object(installer,'SILERO_WHEEL_SHA256',hashlib.sha256(wheel).hexdigest()), \
+             patch.object(installer,'SILERO_SHA256',hashlib.sha256(model).hexdigest()), \
+             patch.object(installer.urllib.request,'urlopen',return_value=self.response(wheel)) as download:
+            configuration=installer.install_speech_gate(self.root,download=True)
+            self.assertEqual(Path(configuration['model_path']).read_bytes(),model)
+            request=download.call_args.args[0]
+            self.assertEqual(request.full_url,installer.SILERO_WHEEL_URL)
+            self.assertEqual(download.call_args.kwargs['timeout'],30)
+            self.assertEqual(installer.install_speech_gate(self.root),configuration)
+            self.assertEqual(download.call_count,1)
+
+    def test_download_rejects_wrong_wheel_model_redirect_and_oversize_before_publication(self):
+        wheel,model=self.wheel()
+        valid_wheel_sha=hashlib.sha256(wheel).hexdigest()
+        cases=[('wheel',wheel,installer.SILERO_WHEEL_URL,'b'*64,hashlib.sha256(model).hexdigest(),16*1024*1024),
+               ('model',wheel,installer.SILERO_WHEEL_URL,valid_wheel_sha,'b'*64,16*1024*1024),
+               ('redirect',wheel,'http://files.pythonhosted.org/insecure.whl',valid_wheel_sha,hashlib.sha256(model).hexdigest(),16*1024*1024),
+               ('size',wheel,installer.SILERO_WHEEL_URL,valid_wheel_sha,hashlib.sha256(model).hexdigest(),16)]
+        for name,data,url,wheel_sha,model_sha,limit in cases:
+            with self.subTest(name=name), \
+                 patch.object(installer,'SILERO_WHEEL_SHA256',wheel_sha), \
+                 patch.object(installer,'SILERO_SHA256',model_sha), \
+                 patch.object(installer,'SILERO_MAX_WHEEL_BYTES',limit), \
+                 patch.object(installer.urllib.request,'urlopen',return_value=self.response(data,url)):
+                with self.assertRaises(ValueError):
+                    installer.install_speech_gate(self.root,download=True)
+                self.assertFalse((self.root/'lab/models').exists())
+
+    def test_network_failure_leaves_existing_runtime_unchanged_and_no_model_published(self):
+        active=self.root/'runtime.json'
+        active.write_bytes(b'{"original":"untouched"}')
+        with patch.object(installer.urllib.request,'urlopen',side_effect=OSError('offline')):
+            with self.assertRaisesRegex(OSError,'offline'):
+                installer.install_speech_gate(self.root,download=True)
+        self.assertEqual(active.read_bytes(),b'{"original":"untouched"}')
         self.assertFalse((self.root/'lab/models').exists())
 
 

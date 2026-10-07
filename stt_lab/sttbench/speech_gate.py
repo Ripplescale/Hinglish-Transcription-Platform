@@ -13,6 +13,12 @@ import time
 import wave
 
 
+# At 16 kHz, modern Silero consumes 512 new samples plus 64 context samples.
+# Legacy snapshots retain their h/c interface and also use 32 ms frames.
+FRAME_SAMPLES = 512
+CONTEXT_SAMPLES = 64
+
+
 @lru_cache(maxsize=2)
 def _load_session(path: str, expected_sha256: str, modified_ns: int, size: int):
     # stat fields invalidate a cached handle if its model file changes in place.
@@ -27,7 +33,7 @@ def _load_session(path: str, expected_sha256: str, modified_ns: int, size: int):
     session = ort.InferenceSession(path, sess_options=options, providers=['CPUExecutionProvider'])
     names = {item.name for item in session.get_inputs()}
     if {'input', 'sr', 'h', 'c'} <= names:
-        interface = 'h_c_480'
+        interface = 'h_c_512'
     elif {'input', 'sr', 'state'} <= names:
         interface = 'state_512'
     else:
@@ -37,25 +43,29 @@ def _load_session(path: str, expected_sha256: str, modified_ns: int, size: int):
 
 def _probabilities(session, samples, gain: float, interface: str):
     import numpy as np
+    if interface not in ('h_c_512', 'state_512'):
+        raise ValueError('Unsupported Silero ONNX interface')
     values = np.clip(samples * gain, -1, 1).astype(np.float32)
-    frame_samples = 480 if interface == 'h_c_480' else 512
+    frame_samples = FRAME_SAMPLES
     h = np.zeros((2, 1, 64), dtype=np.float32)
     c = np.zeros_like(h)
     state = np.zeros((2, 1, 128), dtype=np.float32)
-    context = np.zeros((1, 64), dtype=np.float32)
+    context = np.zeros((1, CONTEXT_SAMPLES), dtype=np.float32)
     probabilities = []
     for offset in range(0, len(values), frame_samples):
         frame = values[offset:offset + frame_samples]
         if len(frame) < frame_samples:
             frame = np.pad(frame, (0, frame_samples - len(frame)))
         inputs = {'input': frame[None, :], 'sr': np.array(16000, dtype=np.int64)}
-        if interface == 'h_c_480':
+        if interface == 'h_c_512':
             inputs.update(h=h, c=c)
             probability, h, c = session.run(None, inputs)
         else:
             inputs.update(input=np.concatenate((context, frame[None, :]), axis=1), state=state)
             probability, state = session.run(None, inputs)
-            context = frame[None, -64:].copy()
+            if np.asarray(state).shape != (2, 1, 128) or not np.isfinite(state).all():
+                raise ValueError('Silero returned invalid recurrent state')
+            context = frame[None, -CONTEXT_SAMPLES:].copy()
         value = float(np.asarray(probability).reshape(-1)[0])
         if not math.isfinite(value) or not 0 <= value <= 1:
             raise ValueError('Silero returned an invalid speech probability')
@@ -84,8 +94,12 @@ def assess_window(path: Path, config: dict | None) -> dict:
                 0 < threshold <= .15 and 0 < boost_peak <= 1 and 1 <= max_gain <= 1000):
             raise ValueError('Invalid conservative Silero gate configuration')
         report.update(model_sha256=expected, threshold=threshold, boost_peak=boost_peak, max_gain=max_gain)
+        if config.get('model_version') is not None:
+            report['model_version'] = config['model_version']
         info = model.stat()
         session, interface, actual = _load_session(str(model), expected, info.st_mtime_ns, info.st_size)
+        if config.get('model_version') == '6.2.3' and interface != 'state_512':
+            raise ValueError('Silero 6.2.3 requires its modern state/context interface')
         import numpy as np
         with wave.open(str(path), 'rb') as wav:
             if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, 16000):
@@ -96,10 +110,11 @@ def assess_window(path: Path, config: dict | None) -> dict:
         raw = _probabilities(session, samples, 1., interface)
         boosted = _probabilities(session, samples, gain, interface)
         skip = max(raw) < threshold and max(boosted) < threshold
-        frame_samples = 480 if interface == 'h_c_480' else 512
+        frame_samples = FRAME_SAMPLES
         combined = np.maximum(raw, boosted)
         report.update(status='ok', skip_stt=bool(skip), decision='skip' if skip else 'keep',
                       model_sha256=actual, interface=interface, frame_samples=frame_samples,
+                      context_samples=CONTEXT_SAMPLES if interface == 'state_512' else 0,
                       duration_seconds=len(samples) / 16000, frame_count=len(raw), analysis_gain=gain,
                       raw_max_probability=max(raw), boosted_max_probability=max(boosted),
                       raw_mean_probability=float(np.mean(raw)), boosted_mean_probability=float(np.mean(boosted)),

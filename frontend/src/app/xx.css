@@ -214,6 +214,25 @@ button:disabled { cursor: not-allowed; }
 }
 
 .font-mono { font-family: inherit; font-variant-numeric: tabular-nums; }
+
+/* Bubble alignment represents recording channels, never inferred speakers. */
+.xx-transcript-source-help { color: var(--xx-muted); font-size: 10px; line-height: 1.6; }
+.xx-transcript-thread { padding: 14px 20px 20px; }
+.xx-transcript-message { width: 86%; max-width: 680px; min-width: 0; padding: 12px 15px; margin-bottom: 14px; border: 1px solid var(--xx-border); border-radius: 16px; color: var(--xx-ink); overflow-wrap: anywhere; box-shadow: 0 2px 3px #4d241c03; }
+.xx-transcript-message-system { margin-right: auto; border-color: #e8d8be; border-bottom-left-radius: 4px; background: #fff2df; }
+.xx-transcript-message-microphone { margin-left: auto; border-color: #efcaba; border-bottom-right-radius: 4px; background: #ffe5db; }
+.xx-transcript-message-unknown { margin-inline: auto; border-color: #e1d9d2; background: #f3eeea; border-radius: 12px; }
+.xx-transcript-message-meta { min-width: 0; }
+.xx-transcript-message-meta button { min-height: 28px; flex-shrink: 0; }
+.xx-transcript-source-label { font-weight: 600; color: var(--xx-ink); }
+.xx-transcript-message-text, .xx-transcript-message details p { overflow-wrap: anywhere; }
+.xx-transcript-message textarea { min-width: 0; overflow-wrap: anywhere; }
+.xx-transcript-message details summary { min-height: 24px; line-height: 1.8; }
+@media(max-width: 800px) {
+  .xx-transcript-thread { padding: 12px 14px 18px; }
+  .xx-transcript-message { width: 92%; padding: 11px 13px; margin-bottom: 12px; }
+}
+
 @container notes-library (max-width: 420px) {
   .xx-library-intro { max-width: calc(100% - 108px); }
   .xx-library-intro .xx-wordmark { font-size: 34px; }

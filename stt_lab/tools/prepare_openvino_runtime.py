@@ -112,7 +112,8 @@ def _copy_export(root: Path, export_source: Path, spec: dict):
     return target,copied
 
 
-def prepare(root: Path, export_source: Path, python: Path | None=None, *, activate=False, speech_gate_model: Path | None=None):
+def prepare(root: Path, export_source: Path, python: Path | None=None, *, activate=False,
+            speech_gate_model: Path | None=None, download_speech_gate=False):
     root=root.resolve(strict=True);export_source=export_source.resolve(strict=True)
     if any(part.lower().startswith('onedrive') for part in root.parts):
         raise ValueError('Keep runtime and models outside OneDrive')
@@ -132,7 +133,7 @@ def prepare(root: Path, export_source: Path, python: Path | None=None, *, activa
     cache.mkdir(parents=True,exist_ok=True)
     candidate=copy.deepcopy(current)
     candidate.update(worker)
-    candidate['speech_gate']=install_speech_gate(root,speech_gate_model)
+    candidate['speech_gate']=install_speech_gate(root,speech_gate_model,download=download_speech_gate)
     candidate['python_executable']=str(python)
     candidate['models']['trelis'].update(backend='openvino',export_path=str(target),cache_dir=str(cache),
                                         device='GPU',dtype='float16',threads=4,num_beams=1,
@@ -163,12 +164,14 @@ if __name__=='__main__':
     source.add_argument('--candidate',type=Path,help='Previously prepared candidate to activate')
     parser.add_argument('--python',type=Path,help='Independent openvino-py312 executable under the data root')
     parser.add_argument('--activate',action='store_true',help='Only after normal app shutdown: preserve legacy job runtimes and activate')
-    parser.add_argument('--speech-gate-model',type=Path,help='Verified local Silero ONNX model; otherwise use the pinned Rust cache')
+    gate=parser.add_mutually_exclusive_group()
+    gate.add_argument('--speech-gate-model',type=Path,help='Verified local Silero 6.2.3 ONNX model for offline setup')
+    gate.add_argument('--download-speech-gate',action='store_true',help='Download and verify the pinned Silero asset during setup only')
     arguments=parser.parse_args()
     if arguments.candidate:
         if not arguments.activate:parser.error('--candidate requires explicit --activate')
         result=activate_runtime(arguments.data_root,arguments.candidate)
     else:
         result=prepare(arguments.data_root,arguments.export_source,arguments.python,activate=arguments.activate,
-                       speech_gate_model=arguments.speech_gate_model)
+                       speech_gate_model=arguments.speech_gate_model,download_speech_gate=arguments.download_speech_gate)
     print(json.dumps(result,ensure_ascii=False))

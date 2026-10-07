@@ -34,7 +34,9 @@ class SyntheticSilero:
         return probability, inputs['h'] + 1, inputs['c'] + 1
 
     def assert_frame(self, inputs):
-        assert inputs['input'].shape == (1, 576 if self.modern else 480)
+        # The official v4 contract rejects 16 kHz input shorter than 512;
+        # the modern interface includes 64 context samples before the frame.
+        assert inputs['input'].shape == (1, 576 if self.modern else 512)
         assert inputs['sr'].dtype == np.int64 and int(inputs['sr']) == 16000
 
 
@@ -62,7 +64,7 @@ class SpeechGateTests(unittest.TestCase):
         session = session or SyntheticSilero()
         path = self.audio(samples)
         before = path.read_bytes()
-        interface = 'state_512' if session.modern else 'h_c_480'
+        interface = 'state_512' if session.modern else 'h_c_512'
         with patch.object(speech_gate, '_load_session', return_value=(session, interface, self.sha)):
             report = speech_gate.assess_window(path, self.config)
         self.assertEqual(path.read_bytes(), before)
@@ -97,6 +99,39 @@ class SpeechGateTests(unittest.TestCase):
         self.assertGreater(report['boosted_max_probability'], .9)
         self.assertFalse(report['skip_stt'])
 
+    def test_official_frame_contract_pads_tail_and_carries_recurrent_state(self):
+        samples = np.ones(513) * 8
+        for modern in (False, True):
+            with self.subTest(modern=modern):
+                report, session = self.assess(samples, SyntheticSilero(modern))
+                self.assertEqual(report['frame_samples'], 512)
+                self.assertEqual(report['frame_count'], 2)
+                self.assertEqual(report['duration_seconds'], 513 / 16000)
+                self.assertEqual(len(session.calls), 4)
+                tail = session.calls[1]['input'][0, -512:]
+                self.assertEqual(tail[0], 8 / 32768)
+                self.assertFalse(tail[1:].any())
+                state_key = 'state' if modern else 'h'
+                self.assertFalse(session.calls[0][state_key].any())
+                self.assertTrue((session.calls[1][state_key] == 1).all())
+                self.assertFalse(session.calls[2][state_key].any())
+                if modern:
+                    self.assertEqual(report['context_samples'], 64)
+                    self.assertTrue((session.calls[1]['input'][0, :64] == 8 / 32768).all())
+                    self.assertFalse(session.calls[2]['input'][0, :64].any())
+                else:
+                    self.assertEqual(report['context_samples'], 0)
+                    self.assertTrue((session.calls[1]['c'] == 1).all())
+                    self.assertFalse(session.calls[2]['c'].any())
+
+    def test_twenty_seconds_has_625_frames_with_measured_evidence_duration(self):
+        with patch.object(speech_gate, '_probabilities', return_value=[.2] * 625):
+            report, _ = self.assess(np.ones(20 * 16000) * 8)
+        self.assertEqual(report['frame_samples'], 512)
+        self.assertEqual(report['frame_count'], 625)
+        self.assertEqual(report['speech_evidence_seconds'], 20)
+        self.assertFalse(report['skip_stt'])
+
     def test_threshold_equality_and_invalid_probability_both_keep_audio(self):
         with patch.object(speech_gate, '_probabilities', return_value=[.15]):
             report, _ = self.assess(np.ones(16000))
@@ -117,8 +152,29 @@ class SpeechGateTests(unittest.TestCase):
                 self.assertFalse(first_gain_frame[state_key].any())
                 if modern:
                     self.assertFalse(first_gain_frame['input'][0, :64].any())
-                self.assertEqual(report['interface'], 'state_512' if modern else 'h_c_480')
+                self.assertEqual(report['interface'], 'state_512' if modern else 'h_c_512')
                 self.assertFalse(report['skip_stt'])
+
+    def test_versioned_modern_model_reports_version_and_keeps_on_wrong_interface(self):
+        self.config['model_version'] = '6.2.3'
+        report, _ = self.assess(np.sin(np.arange(512) * .13) * 8, SyntheticSilero(True))
+        self.assertEqual(report['model_version'], '6.2.3')
+        self.assertEqual(report['interface'], 'state_512')
+        self.assertEqual(report['context_samples'], 64)
+        self.assertFalse(report['skip_stt'])
+        report, _ = self.assess(np.ones(512), SyntheticSilero(False))
+        self.assertEqual(report['status'], 'unavailable')
+        self.assertFalse(report['skip_stt'])
+        self.assertIn('modern state/context', report['error'])
+
+    def test_modern_invalid_recurrent_state_keeps_original(self):
+        class InvalidState(SyntheticSilero):
+            def run(self, outputs, inputs):
+                return np.array([[.01]], dtype=np.float32), np.full((2, 1, 128), np.nan, dtype=np.float32)
+        report, _ = self.assess(np.ones(512), InvalidState(True))
+        self.assertEqual(report['status'], 'unavailable')
+        self.assertFalse(report['skip_stt'])
+        self.assertIn('invalid recurrent state', report['error'])
 
     def test_missing_model_digest_mismatch_and_bad_config_keep_original(self):
         path = self.audio(np.ones(16000) * 8)

@@ -7,6 +7,45 @@ export interface TranscriptCorrection {
   updated_at: string;
 }
 
+export interface TranscriptRecovery {
+  state: 'waiting_for_context' | 'complete';
+  method: 'pending' | 'context_window_retry' | 'shorter_window_retry' | 'original';
+  core_segment_id: string;
+  core_start_seconds: number;
+  core_end_seconds: number;
+  context_start_seconds: number;
+  context_end_seconds: number;
+  desired_context_end_seconds?: number;
+  requires_review: boolean;
+  original_segment_id?: string;
+  original_start_seconds?: number;
+  original_end_seconds?: number;
+  attempts?: { kind: 'context_window_retry' | 'overlap_fringe' | 'shorter_window_retry'; start_seconds: number; end_seconds: number;
+    source_audio_sha256?: string; audio_provenance?: Record<string, unknown>; result?: Record<string, unknown>;
+    quality_flags?: string[]; superseded_segment_id?: string }[];
+}
+
+export interface TranscriptSegmentMetadata {
+  source_track?: string;
+  timestamp_kind?: string;
+  quality_flags?: string[];
+  original_recognition_text?: string;
+  alternative?: { text: string; requires_review?: boolean; reason?: string; promoted?: boolean } | null;
+  recovery?: TranscriptRecovery;
+  replaces_segment_ids?: string[];
+}
+
+export interface TranscriptArchivedSegment {
+  id: string;
+  text: string;
+  source_track?: string;
+  start_seconds?: number;
+  end_seconds?: number;
+  superseded_by?: string[];
+  superseded_at_segments_revision?: number;
+  [key: string]: unknown;
+}
+
 export interface TranscriptWorkspace {
   version: 1;
   meeting_id: string;
@@ -18,7 +57,9 @@ export interface TranscriptWorkspace {
   source_job_id?: string;
   source_meeting_id?: string;
   workflow_role?: 'live-draft' | 'final' | 'live-final' | 'fallback' | null;
-  segment_metadata?: Record<string, { source_track?: string; timestamp_kind?: string; quality_flags?: string[]; original_recognition_text?: string; alternative?: { text: string; requires_review?: boolean; reason?: string; promoted?: boolean } | null }>;
+  segment_metadata?: Record<string, TranscriptSegmentMetadata>;
+  segments_revision?: number;
+  superseded_segments?: TranscriptArchivedSegment[];
   speaker_names?: Record<string, string>;
   speaker_metadata?: {
     speakers: { id: string; display_name?: string | null; active: boolean }[];
@@ -43,6 +84,15 @@ export function effectiveText(segment: Transcript, corrections: TranscriptCorrec
   // A new ASR run must not silently inherit corrections to different source text.
   const correction = corrections.find(item => item.segment_id === segment.id && item.original_text === segment.text);
   return correction?.text ?? segment.text;
+}
+
+/** Ignore unloaded pages unless the archive confirms that their source was replaced. */
+export function earlierCorrections(segments: Transcript[], workspace: TranscriptWorkspace): TranscriptCorrection[] {
+  return workspace.corrections.filter(correction => {
+    const current = segments.find(segment => segment.id === correction.segment_id);
+    if (current?.text === correction.original_text) return false;
+    return !!current || !!workspace.superseded_segments?.some(segment => segment.id === correction.segment_id && segment.text === correction.original_text);
+  });
 }
 
 export function setCorrection(corrections: TranscriptCorrection[], segment: Transcript, text: string, now: string): TranscriptCorrection[] {
@@ -103,6 +153,9 @@ export function makeTranscriptExport(
     speaker_id: segment.speaker_id ?? null,
     quality_flags: workspace.segment_metadata?.[segment.id]?.quality_flags ?? [],
     retry_alternative: workspace.segment_metadata?.[segment.id]?.alternative ?? null,
+    original_recognition_text: workspace.segment_metadata?.[segment.id]?.original_recognition_text ?? null,
+    recovery: workspace.segment_metadata?.[segment.id]?.recovery ?? null,
+    replaces_segment_ids: workspace.segment_metadata?.[segment.id]?.replaces_segment_ids ?? [],
   }));
   if (format === 'json') return JSON.stringify({
     version: 1, kind: 'local_transcript_export', meeting,
@@ -111,6 +164,7 @@ export function makeTranscriptExport(
     source_job_id: workspace.source_job_id ?? null, source_meeting_id: workspace.source_meeting_id ?? null,
     workflow_role: workspace.workflow_role ?? null,
     notes: workspace.notes, corrections: workspace.corrections, segments: rows,
+    segments_revision: workspace.segments_revision ?? null, superseded_segments: workspace.superseded_segments ?? [],
     speaker_names: workspace.speaker_names ?? {}, speaker_metadata: workspace.speaker_metadata ?? null,
   }, null, 2);
   const body = rows.map(row => `[${recordingTime(row.start_seconds ?? undefined)}]${row.source_track ? ` (${row.source_track} track)` : ''} ${row.text}`).join('\n\n');
